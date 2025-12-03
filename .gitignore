@@ -1,0 +1,9 @@
+data/
+MERT/
+CLAUDE.md 
+.vscode/
+.CLAUDE
+__pycache__
+.DS_Store
+tes
+test/test_data.py
