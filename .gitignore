@@ -7,3 +7,10 @@ __pycache__
 .DS_Store
 tes
 test/test_data.py
+.github/
+runs/
+test/
+.gitignore
+.gitignore
+src/models/output_heads.py
+src/__init__.py
