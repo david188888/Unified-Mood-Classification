@@ -19,6 +19,34 @@ _MERT_MODEL_CACHE = {
 }
 
 
+def _apply_subset(items, subset_fraction: float = 1.0, subset_seed: int | None = None):
+    """Return a deterministic subset of items.
+
+    subset_fraction: float in (0, 1]. 1.0 means keep all.
+    subset_seed: RNG seed for reproducibility.
+    """
+    if subset_fraction is None:
+        return items
+
+    try:
+        subset_fraction = float(subset_fraction)
+    except (TypeError, ValueError):
+        raise ValueError(f"subset_fraction must be a float in (0,1], got: {subset_fraction!r}")
+
+    if subset_fraction <= 0.0 or subset_fraction > 1.0:
+        raise ValueError(f"subset_fraction must be in (0,1], got: {subset_fraction}")
+
+    n = len(items)
+    if n == 0 or subset_fraction == 1.0:
+        return items
+
+    k = max(1, int(round(n * subset_fraction)))
+    rng = np.random.default_rng(subset_seed)
+    idx = rng.choice(n, size=k, replace=False)
+    idx.sort()
+    return [items[i] for i in idx]
+
+
 def load_mert_model(model_dir):
     """Load (or reuse) the MERT model and processor."""
     global _MERT_MODEL_CACHE
@@ -44,16 +72,32 @@ def load_mert_model(model_dir):
 class DEAMDataset(Dataset):
     """DEAM Dataset with on-the-fly feature extraction."""
 
-    def __init__(self, split="train", label_path=None, audio_root=None, model_dir=None):
+    def __init__(
+        self,
+        split="train",
+        label_path=None,
+        audio_root=None,
+        model_dir=None,
+        subset_fraction: float = 1.0,
+        subset_seed: int | None = None,
+    ):
         self.split = split
-        self.label_path = label_path or "/Users/david/codespace/Unified-Mood-Classification-Mamba/data/DEAM/annotations/annotations averaged per song/song_level/"
-        self.audio_root = audio_root or "/Users/david/codespace/Unified-Mood-Classification-Mamba/data/DEAM/audio/"
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.label_path = label_path or os.path.join(
+            base_dir,
+            "data",
+            "DEAM",
+            "annotations",
+            "annotations averaged per song",
+            "song_level",
+        )
+        self.audio_root = audio_root or os.path.join(base_dir, "data", "DEAM", "audio")
         self.model_dir = model_dir
 
         # Load split IDs
-        with open("/Users/david/codespace/Unified-Mood-Classification-Mamba/data/DEAM/deam_split.json", "r") as f:
+        with open(os.path.join(base_dir, "data", "DEAM", "deam_split.json"), "r") as f:
             split_data = json.load(f)
-            self.audio_ids = split_data[self.split]
+            self.audio_ids = _apply_subset(split_data[self.split], subset_fraction, subset_seed)
 
         # Load labels
         self.labels = self._load_labels()
@@ -147,12 +191,13 @@ class DEAMDataset(Dataset):
         mel = self.mel_transform(waveform.squeeze(0))  # [n_mels, Time]
         mel = torch.log(mel + 1e-9)  # Log mel
 
-        # Apply SpecAugment
-        time_mask = T.TimeMasking(time_mask_param=30)
-        mel = time_mask(mel)
+        # Apply SpecAugment (train split only)
+        if self.split == "train":
+            time_mask = T.TimeMasking(time_mask_param=30)
+            mel = time_mask(mel)
 
-        freq_mask = T.FrequencyMasking(freq_mask_param=20)
-        mel = freq_mask(mel)
+            freq_mask = T.FrequencyMasking(freq_mask_param=20)
+            mel = freq_mask(mel)
 
         mel = mel.transpose(1, 0)  # [Time, n_mels]
 
@@ -180,13 +225,23 @@ class DEAMDataset(Dataset):
 class MTGJamendoDataset(Dataset):
     """MTG-Jamendo Dataset with on-the-fly feature extraction."""
 
-    def __init__(self, split="train", label_path=None, audio_root=None, model_dir=None):
+    def __init__(
+        self,
+        split="train",
+        label_path=None,
+        audio_root=None,
+        model_dir=None,
+        subset_fraction: float = 1.0,
+        subset_seed: int | None = None,
+    ):
         self.split = split
-        self.label_path = label_path or "/Users/david/codespace/Unified-Mood-Classification-Mamba/data/MTG-Jamendo/mtg_split_labels.csv"
-        self.audio_root = audio_root or "/Users/david/codespace/Unified-Mood-Classification-Mamba/data/MTG-Jamendo"
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.label_path = label_path or os.path.join(base_dir, "data", "MTG-Jamendo", "mtg_split_labels.csv")
+        self.audio_root = audio_root or os.path.join(base_dir, "data", "MTG-Jamendo")
         self.model_dir = model_dir
         self.mood_tags = self._load_tags()
-        self.data = self._load_data()
+        # Avoid loading all rows into memory when using a subset.
+        self.data = self._load_data(subset_fraction=subset_fraction, subset_seed=subset_seed)
 
         # Initialize Mel transform with matched hop length
         self.mel_transform = T.MelSpectrogram(
@@ -211,9 +266,21 @@ class MTGJamendoDataset(Dataset):
                     tags.add(tag)
         return sorted(list(tags))
 
-    def _load_data(self):
-        """Load MTG-Jamendo data for the given split."""
+    def _load_data(self, subset_fraction: float = 1.0, subset_seed: int | None = None):
+        """Load MTG-Jamendo data for the given split.
+
+        If subset_fraction < 1, performs deterministic Bernoulli sampling while
+        streaming the CSV to avoid holding the full split in memory.
+        """
+        # Validate subset fraction
+        subset_fraction = float(subset_fraction) if subset_fraction is not None else 1.0
+        if subset_fraction <= 0.0 or subset_fraction > 1.0:
+            raise ValueError(f"subset_fraction must be in (0,1], got: {subset_fraction}")
+
+        rng = np.random.default_rng(subset_seed)
         data = []
+        first_candidate = None
+
         with open(self.label_path, "r") as f:
             next(f)  # Skip header
             for line in f:
@@ -235,12 +302,24 @@ class MTGJamendoDataset(Dataset):
                     continue
 
                 mood_tags = mood_tags_str.split("|")
-
-                data.append({
+                item = {
                     "track_id": track_id,
                     "audio_path": audio_path,
-                    "mood_tags": mood_tags
-                })
+                    "mood_tags": mood_tags,
+                }
+
+                if first_candidate is None:
+                    first_candidate = item
+
+                if subset_fraction < 1.0 and rng.random() >= subset_fraction:
+                    continue
+
+                data.append(item)
+
+        # Avoid empty dataset when fraction is tiny
+        if not data and first_candidate is not None:
+            data = [first_candidate]
+
         return data
 
     def __len__(self):
@@ -308,8 +387,8 @@ class MTGJamendoDataset(Dataset):
             mel = self.mel_transform(chunk)  # [n_mels, Time]
             mel = torch.log(mel + 1e-9)  # Log mel
 
-            # Apply SpecAugment
-            if np.random.random() < 0.5:  # SpecAugment probability
+            # Apply SpecAugment (train split only)
+            if self.split == "train" and np.random.random() < 0.5:  # SpecAugment probability
                 time_mask = T.TimeMasking(time_mask_param=30)
                 mel = time_mask(mel)
 

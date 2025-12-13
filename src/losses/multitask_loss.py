@@ -17,6 +17,12 @@ def concordance_correlation_coefficient(preds, targets):
     Returns:
         torch.Tensor: CCC value
     """
+    # On Apple MPS (MPSGraph), some elementwise ops (e.g., subtract) require
+    # identical dtypes for all operands/results. Under autocast, model outputs
+    # may become fp16 while labels remain fp32, which can crash.
+    preds = preds.float()
+    targets = targets.float()
+
     B, D = preds.shape
 
     # Mean of predictions and targets
@@ -46,10 +52,10 @@ class MultitaskLoss(nn.Module):
         self.deam_loss = nn.MSELoss()  # DEAM: Regression task
         self.mtg_loss = nn.BCEWithLogitsLoss()  # MTG-Jamendo: Multi-label classification
 
-        # Learnable uncertainty parameters for each task
-        # These are standard deviations (σ) that will be optimized
-        self.deam_sigma = nn.Parameter(torch.tensor(1.0))  # σ1 for regression
-        self.mtg_sigma = nn.Parameter(torch.tensor(1.0))  # σ2 for classification
+        # Learnable uncertainty parameters (log σ) for numerical stability
+        # Using log σ guarantees σ = exp(log σ) > 0.
+        self.deam_log_sigma = nn.Parameter(torch.zeros(()))
+        self.mtg_log_sigma = nn.Parameter(torch.zeros(()))
 
     def forward(self, model_outputs, true_labels, task_type):
         """
@@ -66,20 +72,25 @@ class MultitaskLoss(nn.Module):
         if task_type == 'deam':
             # DEAM task: Valence/Arousal regression
             regression_output = model_outputs['regression']
-            loss = self.deam_loss(regression_output, true_labels)
+            # Compute loss/metrics in fp32 to avoid MPS dtype mismatch under AMP.
+            regression_output_fp32 = regression_output.float()
+            true_labels_fp32 = true_labels.float()
+            loss = self.deam_loss(regression_output_fp32, true_labels_fp32)
 
             # Uncertainty weighting for regression task
-            weighted_loss = (1.0 / (2.0 * torch.square(self.deam_sigma))) * loss + torch.log(self.deam_sigma)
+            weighted_loss = 0.5 * torch.exp(-2.0 * self.deam_log_sigma) * loss + self.deam_log_sigma
 
-            metric = concordance_correlation_coefficient(regression_output, true_labels)
+            metric = concordance_correlation_coefficient(regression_output_fp32, true_labels_fp32)
             return weighted_loss, metric
         elif task_type == 'mtg':
             # MTG-Jamendo task: Mood tag classification
             classification_output = model_outputs['classification']
-            loss = self.mtg_loss(classification_output, true_labels)
+            classification_output_fp32 = classification_output.float()
+            true_labels_fp32 = true_labels.float()
+            loss = self.mtg_loss(classification_output_fp32, true_labels_fp32)
 
             # Uncertainty weighting for classification task
-            weighted_loss = (1.0 / (2.0 * torch.square(self.mtg_sigma))) * loss + torch.log(self.mtg_sigma)
+            weighted_loss = 0.5 * torch.exp(-2.0 * self.mtg_log_sigma) * loss + self.mtg_log_sigma
 
             metric = None  # CCC not applicable for classification
             return weighted_loss, metric
