@@ -20,6 +20,8 @@ class UnifiedMoodModel(nn.Module):
         num_transformer_layers (int): Number of Transformer layers (default: 4)
         num_heads (int): Number of attention heads (default: 8)
         num_class_tags (int): Number of classification tags (default: 18)
+        deam_v_range (tuple): Valence output range (min, max), default (1.6, 8.4)
+        deam_a_range (tuple): Arousal output range (min, max), default (1.6, 8.2)
     """
 
     def __init__(self,
@@ -27,7 +29,9 @@ class UnifiedMoodModel(nn.Module):
                  hidden_dim=512,
                  num_transformer_layers=4,
                  num_heads=8,
-                 num_class_tags=18):
+                 num_class_tags=18,
+                 deam_v_range=(1.6, 8.4),
+                 deam_a_range=(1.6, 8.2)):
         super().__init__()
 
         self.fusion_type = fusion_type
@@ -58,7 +62,12 @@ class UnifiedMoodModel(nn.Module):
             self.encoder = ConvTransformerEncoder(in_dim=conv_transformer_in_dim, hidden_dim=hidden_dim, num_layers=num_transformer_layers, num_heads=num_heads)
 
         # Task-specific output heads
-        self.output_heads = OutputHeads(hidden_dim=hidden_dim, num_class_tags=num_class_tags)
+        self.output_heads = OutputHeads(
+            hidden_dim=hidden_dim,
+            num_class_tags=num_class_tags,
+            deam_v_range=deam_v_range,
+            deam_a_range=deam_a_range
+        )
 
     def forward(self, features):
         """Forward pass for the unified mood model

@@ -5,6 +5,7 @@ import argparse
 from contextlib import nullcontext
 import os
 import time
+import logging
 import numpy as np
 import torch
 import torch.optim as optim
@@ -77,6 +78,17 @@ def _ccc_np(pred: np.ndarray, target: np.ndarray, eps: float = 1e-8) -> float:
     return float(np.nanmean(ccc))
 
 
+def _ccc_np_per_dim(pred: np.ndarray, target: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    # pred/target: [N, D]
+    pred_mean = pred.mean(axis=0)
+    target_mean = target.mean(axis=0)
+    pred_var = ((pred - pred_mean) ** 2).mean(axis=0)
+    target_var = ((target - target_mean) ** 2).mean(axis=0)
+    cov = ((pred - pred_mean) * (target - target_mean)).mean(axis=0)
+    ccc = (2.0 * cov) / (pred_var + target_var + (pred_mean - target_mean) ** 2 + eps)
+    return ccc
+
+
 def _pearson_np(pred: np.ndarray, target: np.ndarray, eps: float = 1e-8) -> float:
     # pred/target: [N, D]
     pred_mean = pred.mean(axis=0)
@@ -94,6 +106,30 @@ def _rmse_np(pred: np.ndarray, target: np.ndarray) -> float:
     # pred/target: [N, D]
     rmse_per_dim = np.sqrt(((pred - target) ** 2).mean(axis=0))
     return float(np.nanmean(rmse_per_dim))
+
+
+def _ensure_metrics_header(path: str, header: list[str]) -> None:
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            f.write(",".join(header) + "\n")
+
+
+def _format_metric_value(value: object) -> str:
+    if value is None:
+        return "nan"
+    if isinstance(value, (float, np.floating)):
+        if np.isnan(value):
+            return "nan"
+        return f"{value:.6f}"
+    if isinstance(value, (int, np.integer)):
+        return str(value)
+    return str(value)
+
+
+def _append_epoch_metrics(path: str, header: list[str], row: dict[str, object]) -> None:
+    values = [_format_metric_value(row.get(key, float("nan"))) for key in header]
+    with open(path, "a") as f:
+        f.write(",".join(values) + "\n")
 
 
 def _mtg_metrics(y_true: np.ndarray, y_score: np.ndarray, threshold: float = 0.5) -> dict:
@@ -164,7 +200,7 @@ def _print_dataset_summaries(deam_loader, mtg_train_loader, mtg_val_loader) -> N
         va = np.asarray(list(deam_labels_dict.values()), dtype=np.float32)  # [N, 2]
         v = va[:, 0]
         a = va[:, 1]
-        print(
+        logging.info(
             "DEAM label range (static song-level): "
             f"valence min/max={v.min():.3f}/{v.max():.3f}, "
             f"arousal min/max={a.min():.3f}/{a.max():.3f}"
@@ -178,7 +214,7 @@ def _print_dataset_summaries(deam_loader, mtg_train_loader, mtg_val_loader) -> N
         if isinstance(mood_tags, list) and isinstance(data, list) and mood_tags and data:
             pos_per_item = np.asarray([len(item.get("mood_tags", [])) for item in data], dtype=np.float32)
             density = float(pos_per_item.mean() / len(mood_tags))
-            print(
+            logging.info(
                 f"MTG-{split_name} tags: C={len(mood_tags)} "
                 f"avg_pos_per_sample={pos_per_item.mean():.3f} "
                 f"(density~{density:.4f})"
@@ -205,12 +241,53 @@ def main():
     parser.add_argument('--log_interval', type=int, default=10, help='Log training metrics every N optimizer steps')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of data loading workers for precomputed features (suggest 2-6 on Mac)')
     parser.add_argument('--compile', action='store_true', help='Use torch.compile for model optimization (requires PyTorch 2.0+)')
+    parser.add_argument('--normalize_deam_labels', action='store_true', help='对DEAM标签进行z-score归一化（推荐用于提升训练稳定性）')
 
     args = parser.parse_args()
 
+    # Setup logging
+    log_dir = f"runs/unified_mood_model_{args.fusion_type}"
+    os.makedirs(log_dir, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(os.path.join(log_dir, 'training.log')),
+            logging.StreamHandler()
+        ]
+    )
+    logger = logging.getLogger(__name__)
+
+    metrics_header = [
+        "epoch",
+        "train_loss",
+        "train_deam_ccc",
+        "val_loss",
+        "val_deam_ccc",
+        "val_deam_rmse",
+        "val_deam_pearson",
+        "val_deam_ccc_epoch",
+        "val_deam_ccc_valence",
+        "val_deam_ccc_arousal",
+        "mtg_threshold",
+        "mtg_roc_auc_micro",
+        "mtg_roc_auc_macro",
+        "mtg_pr_auc_micro",
+        "mtg_pr_auc_macro",
+        "mtg_f1_micro",
+        "mtg_f1_macro",
+        "mtg_precision_micro",
+        "mtg_precision_macro",
+        "mtg_recall_micro",
+        "mtg_recall_macro",
+    ]
+    metrics_path = os.path.join(log_dir, "metrics.csv")
+    _ensure_metrics_header(metrics_path, metrics_header)
+    logger.info(f"Epoch metrics will be saved to: {metrics_path}")
+
     # 2. 设备配置（mac 优先使用 MPS）
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"Using device: {device}")
+    logger.info(f"Using device: {device}")
 
     use_amp = device.type == "mps"
     autocast_ctx = torch.amp.autocast(device_type="mps", dtype=torch.float16) if use_amp else nullcontext()
@@ -218,12 +295,12 @@ def main():
     # 3. 数据加载
     # 始终使用快速模式（预计算特征）。
     # 训练前请先运行：python precompute_features.py --dataset all
-    print("\n🚀 使用快速模式 (预计算特征)")
+    logger.info("\n🚀 使用快速模式 (预计算特征)")
     loader_fn = get_dataloader_fast
-    loader_kwargs = {'num_workers': args.num_workers}
+    loader_kwargs = {'num_workers': args.num_workers, 'normalize_deam_labels': args.normalize_deam_labels}
 
     # Load DEAM datasets (train/val/test)
-    print("Loading DEAM dataset...")
+    logger.info("Loading DEAM dataset...")
     deam_train_loader = loader_fn(
         "deam",
         split="train",
@@ -252,7 +329,7 @@ def main():
     )
 
     # Load MTG-Jamendo datasets (train/val/test)
-    print("Loading MTG-Jamendo dataset...")
+    logger.info("Loading MTG-Jamendo dataset...")
     mtg_train_loader = loader_fn(
         "mtg-jamendo",
         split="train",
@@ -287,34 +364,36 @@ def main():
     _print_dataset_summaries(deam_train_loader, mtg_train_loader, mtg_val_loader)
 
     # 4. 模型初始化
-    print("Initializing model...")
+    logger.info("Initializing model...")
     model = UnifiedMoodModel(
         fusion_type=args.fusion_type,
         hidden_dim=args.hidden_dim,
         num_transformer_layers=args.num_transformer_layers,
         num_heads=args.num_heads,
-        num_class_tags=num_mtg_tags
+        num_class_tags=num_mtg_tags,
+        deam_v_range=(1.6, 8.4),
+        deam_a_range=(1.6, 8.2)
     )
     model = model.to(device)  # Use full precision, let AMP handle automatic mixed precision
 
     # 可选: 使用 torch.compile 加速 (PyTorch 2.0+)
     if args.compile:
-        print("Compiling model with torch.compile...")
+        logger.info("Compiling model with torch.compile...")
         try:
             # 注意: MPS 后端对 torch.compile 支持有限，使用 'reduce-overhead' 模式
             model = torch.compile(model, mode='reduce-overhead')
-            print("✅ Model compiled successfully")
+            logger.info("✅ Model compiled successfully")
         except Exception as e:
-            print(f"⚠️ torch.compile failed, using eager mode: {e}")
+            logger.info(f"⚠️ torch.compile failed, using eager mode: {e}")
 
     # 5. 损失函数与优化器
     loss_fn = MultitaskLoss().to(device)  # Move loss to device
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
 
     # 6. TensorBoard 初始化
-    log_dir = f"runs/unified_mood_model_{args.fusion_type}"
+    # log_dir is already defined above
     writer = SummaryWriter(log_dir)
-    print(f"TensorBoard logs will be saved to: {log_dir}")
+    logger.info(f"TensorBoard logs will be saved to: {log_dir}")
 
     # Track best MTG threshold (selected on validation set) across epochs
     best_mtg_val_f1_micro = -1.0
@@ -327,28 +406,28 @@ def main():
     # 6.1 Resume from checkpoint if specified
     if args.resume:
         if os.path.isfile(args.resume):
-            print(f"Loading checkpoint from: {args.resume}")
+            logger.info(f"Loading checkpoint from: {args.resume}")
             checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
 
             # Load model state
             model.load_state_dict(checkpoint['model_state_dict'])
-            print("Model state loaded.")
+            logger.info("Model state loaded.")
 
             # Load optimizer state (if available)
             if 'optimizer_state_dict' in checkpoint:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                print("Optimizer state loaded.")
+                logger.info("Optimizer state loaded.")
                 # Override learning rate with current args.lr (allows tuning LR on resume)
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = args.lr
-                print(f"Learning rate set to: {args.lr}")
+                logger.info(f"Learning rate set to: {args.lr}")
             else:
-                print("Warning: No optimizer state in checkpoint, optimizer starts fresh.")
+                logger.info("Warning: No optimizer state in checkpoint, optimizer starts fresh.")
 
             # Restore epoch counter
             if 'epoch' in checkpoint:
                 start_epoch = checkpoint['epoch'] + 1
-                print(f"Resuming from epoch {start_epoch + 1}")
+                logger.info(f"Resuming from epoch {start_epoch + 1}")
 
             # Restore step counter (for TensorBoard alignment)
             optimizer_step = int(checkpoint.get('optimizer_step', 0))
@@ -358,12 +437,12 @@ def main():
             best_mtg_val_f1_micro = checkpoint.get('best_mtg_val_f1_micro', -1.0)
             best_mtg_threshold = checkpoint.get('best_mtg_threshold', None)
             best_mtg_epoch = checkpoint.get('best_mtg_epoch', None)
-            print(f"Restored best_val_loss={best_val_loss:.4f}, best_mtg_f1_micro={best_mtg_val_f1_micro:.4f}")
+            logger.info(f"Restored best_val_loss={best_val_loss:.4f}, best_mtg_f1_micro={best_mtg_val_f1_micro:.4f}")
         else:
-            print(f"Warning: Checkpoint not found at '{args.resume}', starting from scratch.")
+            logger.info(f"Warning: Checkpoint not found at '{args.resume}', starting from scratch.")
 
     # 7. 训练循环
-    print(f"Starting training with {args.epochs} epochs (from epoch {start_epoch + 1})...")
+    logger.info(f"Starting training with {args.epochs} epochs (from epoch {start_epoch + 1})...")
     for epoch in range(start_epoch, args.epochs):
         epoch_t0 = time.perf_counter()
         model.train()
@@ -371,15 +450,6 @@ def main():
         deam_total = 0
         mtg_total = 0
         deam_ccc = 0.0
-
-        # Step-window accumulators (reset after each optimizer.step)
-        step_loss_sum = 0.0
-        step_samples = 0
-        step_deam_loss_sum = 0.0
-        step_deam_samples = 0
-        step_mtg_loss_sum = 0.0
-        step_mtg_samples = 0
-        step_deam_ccc_sum = 0.0
 
         # 交替训练两个数据集
         deam_iter = iter(deam_train_loader)
@@ -429,16 +499,6 @@ def main():
                 if ccc is not None:
                     deam_ccc += ccc.item() * deam_features['mel'].size(0)
 
-                # Step-window statistics (use un-normalized loss value)
-                deam_bs = int(deam_features['mel'].size(0))
-                deam_loss_val = float(loss.item() * args.accumulation_steps)
-                step_loss_sum += deam_loss_val * deam_bs
-                step_samples += deam_bs
-                step_deam_loss_sum += deam_loss_val * deam_bs
-                step_deam_samples += deam_bs
-                if ccc is not None:
-                    step_deam_ccc_sum += float(ccc.item()) * deam_bs
-
                 # Update accumulation counter
                 accumulation_counter += 1
 
@@ -476,14 +536,6 @@ def main():
                 running_loss += (loss.item() * args.accumulation_steps) * mtg_features['mel'].size(0)
                 mtg_total += mtg_features['mel'].size(0)
 
-                # Step-window statistics (use un-normalized loss value)
-                mtg_bs = int(mtg_features['mel'].size(0))
-                mtg_loss_val = float(loss.item() * args.accumulation_steps)
-                step_loss_sum += mtg_loss_val * mtg_bs
-                step_samples += mtg_bs
-                step_mtg_loss_sum += mtg_loss_val * mtg_bs
-                step_mtg_samples += mtg_bs
-
                 # Update accumulation counter
                 accumulation_counter += 1
 
@@ -500,28 +552,9 @@ def main():
                 optimizer.zero_grad()
                 accumulation_counter = 0
 
-                # Update optimizer step counter and write step-based TensorBoard logs
+                # Update optimizer step counter
                 optimizer_step += 1
                 lr = float(optimizer.param_groups[0].get("lr", args.lr))
-
-                if args.log_interval > 0 and (optimizer_step % int(args.log_interval) == 0):
-                    if step_samples > 0:
-                        writer.add_scalar('Train/loss_total', float(step_loss_sum) / float(step_samples), optimizer_step)
-                    if step_deam_samples > 0:
-                        writer.add_scalar('Train/loss_deam', float(step_deam_loss_sum) / float(step_deam_samples), optimizer_step)
-                        writer.add_scalar('Train/deam_ccc', float(step_deam_ccc_sum) / float(step_deam_samples), optimizer_step)
-                    if step_mtg_samples > 0:
-                        writer.add_scalar('Train/loss_mtg', float(step_mtg_loss_sum) / float(step_mtg_samples), optimizer_step)
-                    writer.add_scalar('Train/lr', lr, optimizer_step)
-
-                # Reset step-window accumulators
-                step_loss_sum = 0.0
-                step_samples = 0
-                step_deam_loss_sum = 0.0
-                step_deam_samples = 0
-                step_mtg_loss_sum = 0.0
-                step_mtg_samples = 0
-                step_deam_ccc_sum = 0.0
 
             # Update progress bar postfix (cheap, numeric only)
             seen = deam_total + mtg_total
@@ -539,24 +572,6 @@ def main():
 
             optimizer_step += 1
             lr = float(optimizer.param_groups[0].get("lr", args.lr))
-
-            if args.log_interval > 0 and (optimizer_step % int(args.log_interval) == 0):
-                if step_samples > 0:
-                    writer.add_scalar('Train/loss_total', float(step_loss_sum) / float(step_samples), optimizer_step)
-                if step_deam_samples > 0:
-                    writer.add_scalar('Train/loss_deam', float(step_deam_loss_sum) / float(step_deam_samples), optimizer_step)
-                    writer.add_scalar('Train/deam_ccc', float(step_deam_ccc_sum) / float(step_deam_samples), optimizer_step)
-                if step_mtg_samples > 0:
-                    writer.add_scalar('Train/loss_mtg', float(step_mtg_loss_sum) / float(step_mtg_samples), optimizer_step)
-                writer.add_scalar('Train/lr', lr, optimizer_step)
-
-            step_loss_sum = 0.0
-            step_samples = 0
-            step_deam_loss_sum = 0.0
-            step_deam_samples = 0
-            step_mtg_loss_sum = 0.0
-            step_mtg_samples = 0
-            step_deam_ccc_sum = 0.0
 
         # Calculate epoch statistics
         epoch_loss = running_loss / (deam_total + mtg_total) if (deam_total + mtg_total) > 0 else 0.0
@@ -654,14 +669,53 @@ def main():
         writer.add_scalar('Validation/DEAM_CCC', val_avg_deam_ccc, optimizer_step)
 
         # Compute epoch-level DEAM metrics on full validation set
+        deam_pred = None
+        deam_tgt = None
+        deam_rmse = float("nan")
+        deam_pearson = float("nan")
+        deam_ccc_epoch = float("nan")
+        deam_ccc_valence = float("nan")
+        deam_ccc_arousal = float("nan")
         if deam_val_preds and deam_val_targets:
             deam_pred = np.concatenate(deam_val_preds, axis=0)
             deam_tgt = np.concatenate(deam_val_targets, axis=0)
-            writer.add_scalar('Validation/DEAM_RMSE', _rmse_np(deam_pred, deam_tgt), optimizer_step)
-            writer.add_scalar('Validation/DEAM_Pearson', _pearson_np(deam_pred, deam_tgt), optimizer_step)
-            writer.add_scalar('Validation/DEAM_CCC_epoch', _ccc_np(deam_pred, deam_tgt), optimizer_step)
+
+            # 如果使用了标签归一化，反归一化到原始范围
+            if args.normalize_deam_labels:
+                from dataloader_fast import DEAMDatasetCached
+                stats = DEAMDatasetCached.LABEL_STATS
+                deam_pred[:, 0] = deam_pred[:, 0] * stats['valence_std'] + stats['valence_mean']
+                deam_pred[:, 1] = deam_pred[:, 1] * stats['arousal_std'] + stats['arousal_mean']
+                deam_tgt[:, 0] = deam_tgt[:, 0] * stats['valence_std'] + stats['valence_mean']
+                deam_tgt[:, 1] = deam_tgt[:, 1] * stats['arousal_std'] + stats['arousal_mean']
+
+            deam_ccc_per_dim = _ccc_np_per_dim(deam_pred, deam_tgt)
+            deam_rmse = _rmse_np(deam_pred, deam_tgt)
+            deam_pearson = _pearson_np(deam_pred, deam_tgt)
+            deam_ccc_epoch = _ccc_np(deam_pred, deam_tgt)
+            writer.add_scalar('Validation/DEAM_RMSE', deam_rmse, optimizer_step)
+            writer.add_scalar('Validation/DEAM_Pearson', deam_pearson, optimizer_step)
+            writer.add_scalar('Validation/DEAM_CCC_epoch', deam_ccc_epoch, optimizer_step)
+            if deam_ccc_per_dim.size >= 2:
+                deam_ccc_valence = float(deam_ccc_per_dim[0])
+                deam_ccc_arousal = float(deam_ccc_per_dim[1])
+                writer.add_scalar('Validation/DEAM_CCC_Valence', deam_ccc_valence, optimizer_step)
+                writer.add_scalar('Validation/DEAM_CCC_Arousal', deam_ccc_arousal, optimizer_step)
 
         # Compute epoch-level MTG metrics on full validation set
+        mtg_threshold = float("nan")
+        mtg_m = {
+            "roc_auc_micro": float("nan"),
+            "roc_auc_macro": float("nan"),
+            "pr_auc_micro": float("nan"),
+            "pr_auc_macro": float("nan"),
+            "f1_micro": float("nan"),
+            "f1_macro": float("nan"),
+            "precision_micro": float("nan"),
+            "precision_macro": float("nan"),
+            "recall_micro": float("nan"),
+            "recall_macro": float("nan"),
+        }
         if mtg_val_scores and mtg_val_targets:
             y_score = np.concatenate(mtg_val_scores, axis=0)
             y_true = np.concatenate(mtg_val_targets, axis=0).astype(np.int32)
@@ -676,7 +730,7 @@ def main():
                     dbg_score = y_score[:dbg_n]
                     dbg_true = y_true[:dbg_n]
                     dbg_pred = _binarize_with_top1_fallback(dbg_score, mtg_threshold)
-                    print(
+                    logger.info(
                         "MTG debug "
                         f"(n={dbg_n}, thr={mtg_threshold:.2f}, top1_fallback=on): "
                         f"prob_mean={dbg_score.mean():.4f} prob_max={dbg_score.max():.4f} | "
@@ -707,10 +761,6 @@ def main():
         val_dt = time.perf_counter() - val_t0
         epoch_dt = time.perf_counter() - epoch_t0
 
-        deam_rmse = _rmse_np(deam_pred, deam_tgt) if (deam_val_preds and deam_val_targets) else float("nan")
-        deam_pearson = _pearson_np(deam_pred, deam_tgt) if (deam_val_preds and deam_val_targets) else float("nan")
-        deam_ccc_epoch = _ccc_np(deam_pred, deam_tgt) if (deam_val_preds and deam_val_targets) else float("nan")
-
         mtg_line = ""
         if mtg_val_scores and mtg_val_targets:
             mtg_line = (
@@ -724,14 +774,42 @@ def main():
                 f" | best(MTG F1μ={best_mtg_val_f1_micro:.4f} thr={best_mtg_threshold:.2f} @ep={best_mtg_epoch+1})"
             )
 
-        print(
+        logger.info(
             f"Epoch {epoch+1}/{args.epochs} "
             f"train: loss={epoch_loss:.4f} deam_ccc={avg_deam_ccc:.4f} "
             f"| val: loss={val_epoch_loss:.4f} deam_ccc={val_avg_deam_ccc:.4f} "
             f"rmse={deam_rmse:.4f} r={deam_pearson:.4f} ccc={deam_ccc_epoch:.4f}"
             f"{mtg_line}{best_line}"
         )
-        print(f"time: epoch={epoch_dt:.1f}s (val={val_dt:.1f}s) lr={lr:.1e}")
+        logger.info(f"time: epoch={epoch_dt:.1f}s (val={val_dt:.1f}s) lr={lr:.1e}")
+
+        _append_epoch_metrics(
+            metrics_path,
+            metrics_header,
+            {
+                "epoch": epoch + 1,
+                "train_loss": epoch_loss,
+                "train_deam_ccc": avg_deam_ccc,
+                "val_loss": val_epoch_loss,
+                "val_deam_ccc": val_avg_deam_ccc,
+                "val_deam_rmse": deam_rmse,
+                "val_deam_pearson": deam_pearson,
+                "val_deam_ccc_epoch": deam_ccc_epoch,
+                "val_deam_ccc_valence": deam_ccc_valence,
+                "val_deam_ccc_arousal": deam_ccc_arousal,
+                "mtg_threshold": mtg_threshold,
+                "mtg_roc_auc_micro": mtg_m["roc_auc_micro"],
+                "mtg_roc_auc_macro": mtg_m["roc_auc_macro"],
+                "mtg_pr_auc_micro": mtg_m["pr_auc_micro"],
+                "mtg_pr_auc_macro": mtg_m["pr_auc_macro"],
+                "mtg_f1_micro": mtg_m["f1_micro"],
+                "mtg_f1_macro": mtg_m["f1_macro"],
+                "mtg_precision_micro": mtg_m["precision_micro"],
+                "mtg_precision_macro": mtg_m["precision_macro"],
+                "mtg_recall_micro": mtg_m["recall_micro"],
+                "mtg_recall_macro": mtg_m["recall_macro"],
+            },
+        )
 
         # 8.1 Save checkpoint at end of each epoch
         ckpt_dir = os.path.join(log_dir, "checkpoints")
@@ -762,12 +840,24 @@ def main():
             checkpoint_state['best_val_loss'] = best_val_loss
             best_ckpt_path = os.path.join(ckpt_dir, "checkpoint_best.pt")
             torch.save(checkpoint_state, best_ckpt_path)
-            print(f"New best model saved (val_loss={best_val_loss:.4f}) -> {best_ckpt_path}")
+            logger.info(f"New best model saved (val_loss={best_val_loss:.4f}) -> {best_ckpt_path}")
 
-        print("-" * 60)
+        logger.info("-" * 60)
+
+    # Clean up training loaders to release file descriptors
+    logger.info("Cleaning up training resources...")
+    # Save mood_tags before deleting loader
+    mood_tags = getattr(mtg_train_loader.dataset, "mood_tags", None)
+    
+    if 'deam_train_loader' in locals(): del deam_train_loader
+    if 'mtg_train_loader' in locals(): del mtg_train_loader
+    if 'deam_val_loader' in locals(): del deam_val_loader
+    if 'mtg_val_loader' in locals(): del mtg_val_loader
+    import gc
+    gc.collect()
 
     # 9. 测试阶段
-    print("\nStarting final testing...")
+    logger.info("\nStarting final testing...")
     model.eval()
     test_loss = 0.0
     test_deam_total = 0
@@ -831,9 +921,23 @@ def main():
     if deam_test_preds and deam_test_targets:
         deam_pred = np.concatenate(deam_test_preds, axis=0)
         deam_tgt = np.concatenate(deam_test_targets, axis=0)
+
+        # 如果使用了标签归一化，反归一化到原始范围
+        if args.normalize_deam_labels:
+            from dataloader_fast import DEAMDatasetCached
+            stats = DEAMDatasetCached.LABEL_STATS
+            deam_pred[:, 0] = deam_pred[:, 0] * stats['valence_std'] + stats['valence_mean']
+            deam_pred[:, 1] = deam_pred[:, 1] * stats['arousal_std'] + stats['arousal_mean']
+            deam_tgt[:, 0] = deam_tgt[:, 0] * stats['valence_std'] + stats['valence_mean']
+            deam_tgt[:, 1] = deam_tgt[:, 1] * stats['arousal_std'] + stats['arousal_mean']
+
+        deam_ccc_per_dim = _ccc_np_per_dim(deam_pred, deam_tgt)
         writer.add_scalar('Test/DEAM_RMSE', _rmse_np(deam_pred, deam_tgt), optimizer_step)
         writer.add_scalar('Test/DEAM_Pearson', _pearson_np(deam_pred, deam_tgt), optimizer_step)
         writer.add_scalar('Test/DEAM_CCC_epoch', _ccc_np(deam_pred, deam_tgt), optimizer_step)
+        if deam_ccc_per_dim.size >= 2:
+            writer.add_scalar('Test/DEAM_CCC_Valence', float(deam_ccc_per_dim[0]), optimizer_step)
+            writer.add_scalar('Test/DEAM_CCC_Arousal', float(deam_ccc_per_dim[1]), optimizer_step)
 
     if mtg_test_scores and mtg_test_targets:
         y_score = np.concatenate(mtg_test_scores, axis=0)
@@ -853,14 +957,17 @@ def main():
         writer.add_scalar('Test/MTG_Recall_macro', mtg_m['recall_macro'], optimizer_step)
 
     # Print test summary
-    print(f"Test Loss: {test_epoch_loss:.4f}")
-    print(f"Test DEAM CCC: {test_avg_deam_ccc:.4f}")
+    logger.info(f"Test Loss: {test_epoch_loss:.4f}")
+    logger.info(f"Test DEAM CCC: {test_avg_deam_ccc:.4f}")
     if deam_test_preds and deam_test_targets:
-        print(f"Test DEAM RMSE: {_rmse_np(deam_pred, deam_tgt):.4f}")
-        print(f"Test DEAM Pearson: {_pearson_np(deam_pred, deam_tgt):.4f}")
-        print(f"Test DEAM CCC (epoch): {_ccc_np(deam_pred, deam_tgt):.4f}")
+        logger.info(f"Test DEAM RMSE: {_rmse_np(deam_pred, deam_tgt):.4f}")
+        logger.info(f"Test DEAM Pearson: {_pearson_np(deam_pred, deam_tgt):.4f}")
+        logger.info(f"Test DEAM CCC (epoch): {_ccc_np(deam_pred, deam_tgt):.4f}")
+        if deam_ccc_per_dim.size >= 2:
+            logger.info(f"Test DEAM CCC Valence: {float(deam_ccc_per_dim[0]):.4f}")
+            logger.info(f"Test DEAM CCC Arousal: {float(deam_ccc_per_dim[1]):.4f}")
     if mtg_test_scores and mtg_test_targets:
-        print(
+        logger.info(
             "Test MTG "
             f"thr={test_threshold:.2f} (top1_fallback=on) | "
             f"ROC-AUC micro/macro: {mtg_m['roc_auc_micro']:.4f}/{mtg_m['roc_auc_macro']:.4f} | "
@@ -869,11 +976,11 @@ def main():
             f"P micro/macro: {mtg_m['precision_micro']:.4f}/{mtg_m['precision_macro']:.4f} | "
             f"R micro/macro: {mtg_m['recall_micro']:.4f}/{mtg_m['recall_macro']:.4f}"
         )
-    print("-" * 60)
+    logger.info("-" * 60)
 
     # 10. 模型保存与清理
     model_save_path = f"unified_mood_model_{args.fusion_type}.pt"
-    mood_tags = getattr(mtg_train_loader.dataset, "mood_tags", None)
+    # mood_tags is already saved above before cleanup
     ckpt = {
         "model_state_dict": model.state_dict(),
         "fusion_type": args.fusion_type,
@@ -886,11 +993,11 @@ def main():
     torch.save(ckpt, model_save_path)
     writer.close()
 
-    print(f"\nTraining completed!")
-    print(f"Model saved to: {model_save_path}")
-    print(f"TensorBoard logs: {log_dir}")
-    print("\nTo view TensorBoard:")
-    print(f"tensorboard --logdir={log_dir}")
+    logger.info(f"\nTraining completed!")
+    logger.info(f"Model saved to: {model_save_path}")
+    logger.info(f"TensorBoard logs: {log_dir}")
+    logger.info("\nTo view TensorBoard:")
+    logger.info(f"tensorboard --logdir={log_dir}")
 
 if __name__ == "__main__":
     main()
