@@ -15,16 +15,22 @@ class OutputHeads(nn.Module):
     Args:
         hidden_dim (int): Input hidden dimension (default: 512)
         num_class_tags (int): Number of classification tags (default: 18)
+        deam_v_range (tuple): Valence输出范围 (min, max)，默认 (1.6, 8.4)
+        deam_a_range (tuple): Arousal输出范围 (min, max)，默认 (1.6, 8.2)
     """
 
-    def __init__(self, hidden_dim=512, num_class_tags=18):
+    def __init__(self, hidden_dim=512, num_class_tags=18,
+                 deam_v_range=(1.6, 8.4), deam_a_range=(1.6, 8.2)):
         super().__init__()
+
+        self.deam_v_min, self.deam_v_max = deam_v_range
+        self.deam_a_min, self.deam_a_max = deam_a_range
 
         # Regression head for DEAM VA prediction
         self.regression_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim//2),
             nn.ReLU(),
-            nn.Linear(hidden_dim//2, 2)  # Output: Valence and Arousal
+            nn.Linear(hidden_dim//2, 2)  # Output: Valence and Arousal (raw logits)
         )
 
         # Classification head for MTG-Jamendo tag classification
@@ -47,7 +53,14 @@ class OutputHeads(nn.Module):
         x_pooled = x.mean(dim=1)  # shape: [B, D]
 
         # Regression head (DEAM VA prediction)
-        regression_output = self.regression_head(x_pooled)  # shape: [B, 2]
+        regression_raw = self.regression_head(x_pooled)  # shape: [B, 2]
+
+        # 使用sigmoid约束输出到指定范围
+        v_scaled = self.deam_v_min + torch.sigmoid(regression_raw[:, 0]) * \
+                   (self.deam_v_max - self.deam_v_min)
+        a_scaled = self.deam_a_min + torch.sigmoid(regression_raw[:, 1]) * \
+                   (self.deam_a_max - self.deam_a_min)
+        regression_output = torch.stack([v_scaled, a_scaled], dim=1)
 
         # Classification head (MTG-Jamendo tag prediction)
         classification_output = self.classification_head(x_pooled)  # shape: [B, num_class_tags]
