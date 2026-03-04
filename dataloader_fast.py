@@ -307,8 +307,8 @@ class MTGJamendoDatasetCached(Dataset):
         chroma = features['chroma']
         tempogram = features['tempogram']
         
-        # 应用 SpecAugment (仅训练集，50% 概率)
-        if self.apply_augment and np.random.random() < 0.5:
+        # 应用 SpecAugment (仅训练集)
+        if self.apply_augment:
             mel_t = mel.transpose(0, 1).float()
             mel_t = self.time_mask(mel_t)
             mel_t = self.freq_mask(mel_t)
@@ -329,18 +329,27 @@ class MTGJamendoDatasetCached(Dataset):
 
 
 def collate_fn(batch):
-    """Collate function to handle variable-length sequences."""
+    """Collate function to handle variable-length sequences.
+
+    Returns:
+        tuple: (features_batch, labels, lengths) where lengths is a tensor
+               of actual (pre-padding) sequence lengths per sample.
+    """
     features_batch = {}
-    labels = []
 
     all_features, all_labels = zip(*batch)
 
-    # Find global max length
+    # Find global max length and record per-sample actual lengths
     max_len = 0
+    sample_lengths = []
     for feat_dict in all_features:
-        for feat in feat_dict.values():
-            if feat.shape[0] > max_len:
-                max_len = feat.shape[0]
+        # Use any feature to determine the sample's actual sequence length
+        sample_len = next(iter(feat_dict.values())).shape[0]
+        sample_lengths.append(sample_len)
+        if sample_len > max_len:
+            max_len = sample_len
+
+    lengths = torch.tensor(sample_lengths, dtype=torch.int32)
 
     # Stack each feature type
     for key in all_features[0].keys():
@@ -362,7 +371,7 @@ def collate_fn(batch):
 
     labels = torch.stack(all_labels)
 
-    return features_batch, labels
+    return features_batch, labels, lengths
 
 
 def get_dataloader_fast(dataset_name, split="train", batch_size=8, shuffle=True,

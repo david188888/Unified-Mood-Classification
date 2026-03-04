@@ -69,12 +69,14 @@ class UnifiedMoodModel(nn.Module):
             deam_a_range=deam_a_range
         )
 
-    def forward(self, features):
+    def forward(self, features, lengths=None):
         """Forward pass for the unified mood model
 
         Args:
             features (dict): Dictionary of input features with keys
                             'mel', 'chroma', 'tempogram', 'mert'
+            lengths (torch.Tensor, optional): Actual sequence lengths per sample, shape (B,).
+                If None, assumes all sequences have full length (no padding).
 
         Returns:
             dict: Model outputs with 'regression' and 'classification' keys
@@ -88,16 +90,16 @@ class UnifiedMoodModel(nn.Module):
         # Step 3: Encoding
         if self.fusion_type == 'late':
             # Late fusion: encode each feature separately
-            mel_encoded = self.mel_encoder(fused['mel'])
-            chroma_encoded = self.chroma_encoder(fused['chroma'])
-            tempogram_encoded = self.tempogram_encoder(fused['tempogram'])
-            mert_encoded = self.mert_encoder(fused['mert'])
+            mel_encoded = self.mel_encoder(fused['mel'], lengths=lengths)
+            chroma_encoded = self.chroma_encoder(fused['chroma'], lengths=lengths)
+            tempogram_encoded = self.tempogram_encoder(fused['tempogram'], lengths=lengths)
+            mert_encoded = self.mert_encoder(fused['mert'], lengths=lengths)
 
             # Average the encoded features for late fusion
             encoded = (mel_encoded + chroma_encoded + tempogram_encoded + mert_encoded) / 4
         else:
             # Single encoder for fused features
-            encoded = self.encoder(fused)
+            encoded = self.encoder(fused, lengths=lengths)
 
         # Step 4: Task-specific outputs
         outputs = self.output_heads(encoded)
@@ -111,7 +113,7 @@ if __name__ == "__main__":
         'mel': torch.randn(4, 100, 128),  # Batch size 4, 100 time steps, 128 mel features
         'chroma': torch.randn(4, 100, 12),  # Batch size 4, 100 time steps, 12 chroma features
         'tempogram': torch.randn(4, 100, 384),  # Batch size 4, 100 time steps, 384 tempogram features
-        'mert': torch.randn(4, 100, 2048)  # Batch size 4, 100 time steps, 2048 mert features
+        'mert': torch.randn(4, 100, 1024)  # Batch size 4, 100 time steps, 1024 mert features (MERT hidden_size=1024)
     }
 
     print("Testing model with early fusion...")

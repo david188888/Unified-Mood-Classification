@@ -471,16 +471,17 @@ def main():
         for batch_idx in train_pbar:
             # 训练DEAM batch
             try:
-                deam_features, deam_labels = next(deam_iter)
+                deam_features, deam_labels, deam_lengths = next(deam_iter)
 
                 # Move data to device
                 for key in deam_features:
                     deam_features[key] = deam_features[key].to(device)
                 deam_labels = deam_labels.to(device)
+                deam_lengths = deam_lengths.to(device)
 
                 # Forward pass with automatic mixed precision
                 with autocast_ctx:
-                    outputs = model(deam_features)
+                    outputs = model(deam_features, lengths=deam_lengths)
 
                 # Compute loss and metric
                 loss, ccc = loss_fn(outputs, deam_labels, task_type='deam')
@@ -509,16 +510,17 @@ def main():
 
             # 训练MTG batch
             try:
-                mtg_features, mtg_labels = next(mtg_iter)
+                mtg_features, mtg_labels, mtg_lengths = next(mtg_iter)
 
                 # Move data to device
                 for key in mtg_features:
                     mtg_features[key] = mtg_features[key].to(device)
                 mtg_labels = mtg_labels.to(device)
+                mtg_lengths = mtg_lengths.to(device)
 
                 # Forward pass with automatic mixed precision
                 with autocast_ctx:
-                    outputs = model(mtg_features)
+                    outputs = model(mtg_features, lengths=mtg_lengths)
 
                 # Compute loss
                 loss, _ = loss_fn(outputs, mtg_labels, task_type='mtg')
@@ -605,14 +607,15 @@ def main():
                 leave=False,
                 disable=bool(args.no_progress),
             )
-            for features, labels in deam_val_pbar:
+            for features, labels, feat_lengths in deam_val_pbar:
                 for key in features:
                     features[key] = features[key].to(device)
                 labels = labels.to(device)
+                feat_lengths = feat_lengths.to(device)
 
                 # Forward pass with automatic mixed precision
                 with autocast_ctx:
-                    outputs = model(features)
+                    outputs = model(features, lengths=feat_lengths)
                 loss, ccc = loss_fn(outputs, labels, task_type='deam')
 
                 loss = loss * args.deam_weight
@@ -637,14 +640,15 @@ def main():
                 leave=False,
                 disable=bool(args.no_progress),
             )
-            for features, labels in mtg_val_pbar:
+            for features, labels, feat_lengths in mtg_val_pbar:
                 for key in features:
                     features[key] = features[key].to(device)
                 labels = labels.to(device)
+                feat_lengths = feat_lengths.to(device)
 
                 # Forward pass with automatic mixed precision
                 with autocast_ctx:
-                    outputs = model(features)
+                    outputs = model(features, lengths=feat_lengths)
                 loss, _ = loss_fn(outputs, labels, task_type='mtg')
 
                 loss = loss * args.mtg_weight
@@ -871,13 +875,14 @@ def main():
 
     with torch.no_grad():
         # Test DEAM
-        for features, labels in deam_test_loader:
+        for features, labels, feat_lengths in deam_test_loader:
             for key in features:
                 features[key] = features[key].to(device)
             labels = labels.to(device)
+            feat_lengths = feat_lengths.to(device)
 
             with autocast_ctx:
-                outputs = model(features)
+                outputs = model(features, lengths=feat_lengths)
             loss, ccc = loss_fn(outputs, labels, task_type='deam')
 
             loss = loss * args.deam_weight
@@ -891,13 +896,14 @@ def main():
             deam_test_targets.append(labels.detach().cpu().float().numpy())
 
         # Test MTG
-        for features, labels in mtg_test_loader:
+        for features, labels, feat_lengths in mtg_test_loader:
             for key in features:
                 features[key] = features[key].to(device)
             labels = labels.to(device)
+            feat_lengths = feat_lengths.to(device)
 
             with autocast_ctx:
-                outputs = model(features)
+                outputs = model(features, lengths=feat_lengths)
             loss, _ = loss_fn(outputs, labels, task_type='mtg')
 
             loss = loss * args.mtg_weight

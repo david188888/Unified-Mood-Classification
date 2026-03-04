@@ -37,11 +37,13 @@ class ConvTransformerEncoder(nn.Module):
             dropout=dropout
         )
 
-    def forward(self, x):
+    def forward(self, x, lengths=None):
         """Forward pass for Conformer encoder
 
         Args:
             x (torch.Tensor): Input features with shape (B, T, D) where B=batch, T=time steps, D=dimension
+            lengths (torch.Tensor, optional): Actual sequence lengths per sample, shape (B,).
+                If None, assumes all sequences have full length (no padding).
 
         Returns:
             torch.Tensor: Encoded features with shape (B, T, D)
@@ -49,11 +51,12 @@ class ConvTransformerEncoder(nn.Module):
         # Project input to conformer hidden dimension
         x_proj = self.proj(x)  # (B, T, D)
 
-        # Apply Conformer
-        # Conformer expects input shape (B, T, D) when time_first=False
-        # For fixed-length input, pass lengths as tensor of T
+        # Apply Conformer with proper lengths for padding handling
         batch_size, seq_len, _ = x_proj.shape
-        lengths = torch.full((batch_size,), seq_len, dtype=torch.int32, device=x_proj.device)
+        if lengths is None:
+            lengths = torch.full((batch_size,), seq_len, dtype=torch.int32, device=x_proj.device)
+        else:
+            lengths = lengths.to(dtype=torch.int32, device=x_proj.device)
         x_encoded, _ = self.conformer(x_proj, lengths=lengths)
 
         return x_encoded
