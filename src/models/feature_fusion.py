@@ -23,8 +23,12 @@ class FeatureFusion(nn.Module):
 
         if fusion_type == 'early':
             # Early Fusion with Cross-Attention: MERT as Query, others as Key/Value
-            self.other_features_proj = nn.Linear(hidden_dim * 3, hidden_dim)  # Project 3 features to D
+            # Separate projections for Key and Value to allow different representations
+            self.key_proj = nn.Linear(hidden_dim * 3, hidden_dim)
+            self.value_proj = nn.Linear(hidden_dim * 3, hidden_dim)
             self.cross_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
+            # Residual connection + LayerNorm to preserve MERT semantic information
+            self.layer_norm = nn.LayerNorm(hidden_dim)
 
         # For late fusion, no additional layers needed here
 
@@ -48,12 +52,13 @@ class FeatureFusion(nn.Module):
             # Concatenate mel, chroma, tempogram along channel dim to form Key/Value
             other_features = torch.cat([mel, chroma, tempogram], dim=-1)  # [B, T, 3D]
 
-            # Project other features to match MERT's dimension
-            key = self.other_features_proj(other_features)  # [B, T, D]
-            value = self.other_features_proj(other_features)  # [B, T, D]
+            # Separate projections for Key and Value
+            key = self.key_proj(other_features)      # [B, T, D]
+            value = self.value_proj(other_features)   # [B, T, D]
 
-            # Apply Cross-Attention
-            fused, _ = self.cross_attn(query=mert, key=key, value=value)  # [B, T, D]
+            # Apply Cross-Attention with residual connection
+            attn_output, _ = self.cross_attn(query=mert, key=key, value=value)  # [B, T, D]
+            fused = self.layer_norm(mert + attn_output)  # Residual + LayerNorm
 
             return fused
 
