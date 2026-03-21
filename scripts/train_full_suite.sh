@@ -6,11 +6,17 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
-EPOCHS="${EPOCHS:-50}"
+EPOCHS="${EPOCHS:-30}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
+LATE_BATCH_SIZE="${LATE_BATCH_SIZE:-4}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
+RESUME_EXISTING="${RESUME_EXISTING:-1}"
 RUN_STAMP="${RUN_STAMP:-$(date +%Y%m%d_%H%M%S)}"
 SUITE_DIR="runs/experiment_suite_${RUN_STAMP}"
+# Skip experiments before this name (inclusive start).
+# e.g. START_FROM=late_baseline  will skip early_baseline and start from late_baseline.
+START_FROM="${START_FROM:-}"
+_start_reached="${START_FROM:+0}"   # empty → all run; "0" → waiting for match
 
 log() {
     printf '[%s] %s\n' "$(date '+%F %T')" "$*"
@@ -55,6 +61,15 @@ archive_existing_artifacts() {
     fi
 }
 
+resume_checkpoint_path() {
+    local fusion_type="$1"
+    local checkpoint_path="runs/unified_mood_model_${fusion_type}/checkpoints/checkpoint_last.pt"
+
+    if [[ -f "$checkpoint_path" ]]; then
+        printf '%s\n' "$checkpoint_path"
+    fi
+}
+
 save_command_manifest() {
     local dest_dir="$1"
     shift
@@ -88,15 +103,44 @@ run_experiment() {
     local fusion_type="$2"
     shift 2
 
-    archive_existing_artifacts "$fusion_type"
+    # ── START_FROM gate ──
+    if [[ "$_start_reached" == "0" ]]; then
+        if [[ "$experiment_name" == "$START_FROM" ]]; then
+            _start_reached=1
+        else
+            log "Skipping experiment: ${experiment_name} (before START_FROM=${START_FROM})"
+            return 0
+        fi
+    fi
+
+    local resume_ckpt=""
+    if [[ "$RESUME_EXISTING" == "1" ]]; then
+        resume_ckpt="$(resume_checkpoint_path "$fusion_type")"
+    fi
+
+    if [[ -n "$resume_ckpt" ]]; then
+        log "Found existing checkpoint for ${fusion_type}: ${resume_ckpt}. Resuming in place."
+    else
+        archive_existing_artifacts "$fusion_type"
+    fi
+
+    # Late fusion uses 4 separate Conformer encoders (~4x memory),
+    # so it needs a smaller batch size to fit in MPS memory.
+    local bs="$BATCH_SIZE"
+    if [[ "$fusion_type" == "late" ]]; then
+        bs="$LATE_BATCH_SIZE"
+    fi
 
     local -a cmd=(
         "$PYTHON_BIN" train.py
         --fusion_type "$fusion_type"
-        --batch_size "$BATCH_SIZE"
+        --batch_size "$bs"
         --epochs "$EPOCHS"
         --num_workers "$NUM_WORKERS"
     )
+    if [[ -n "$resume_ckpt" ]]; then
+        cmd+=(--resume "$resume_ckpt")
+    fi
     cmd+=("$@")
 
     log "Starting experiment: ${experiment_name}"

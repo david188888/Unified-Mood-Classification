@@ -3,7 +3,9 @@
 
 import argparse
 from contextlib import nullcontext
+import gc
 import os
+import sys
 import time
 import logging
 import numpy as np
@@ -20,6 +22,128 @@ try:
 except Exception:  # pragma: no cover
     def tqdm(iterable=None, *args, **kwargs):  # type: ignore
         return iterable
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+    from rich.table import Table
+    RICH_AVAILABLE = True
+except Exception:  # pragma: no cover
+    Console = None  # type: ignore
+    Panel = None  # type: ignore
+    Progress = None  # type: ignore
+    SpinnerColumn = None  # type: ignore
+    TextColumn = None  # type: ignore
+    BarColumn = None  # type: ignore
+    TaskProgressColumn = None  # type: ignore
+    TimeElapsedColumn = None  # type: ignore
+    TimeRemainingColumn = None  # type: ignore
+    Table = None  # type: ignore
+    RICH_AVAILABLE = False
+
+
+RICH_CONSOLE = Console(stderr=True, soft_wrap=True) if RICH_AVAILABLE else None
+
+
+def _format_progress_stats(stats: dict[str, object] | None) -> str:
+    if not stats:
+        return ""
+
+    parts = []
+    for key, value in stats.items():
+        parts.append(f"{key}={value}")
+    return " | ".join(parts)
+
+
+class _ProgressDisplay:
+    def __init__(self, iterable, desc: str, total: int | None, disable: bool, leave: bool, use_rich: bool):
+        self.iterable = iterable
+        self.disable = disable
+        self.use_rich = bool(use_rich and RICH_AVAILABLE and not disable)
+        self.progress = None
+        self.task_id = None
+
+        if self.use_rich:
+            self.progress = Progress(
+                SpinnerColumn(style="bright_cyan"),
+                TextColumn("[bold bright_white]{task.description}"),
+                BarColumn(complete_style="bright_cyan", finished_style="green", pulse_style="cyan"),
+                TaskProgressColumn(),
+                TextColumn("{task.completed}/{task.total}"),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                TextColumn("{task.fields[stats]}", justify="right"),
+                console=RICH_CONSOLE,
+                expand=True,
+                transient=not leave,
+            )
+            self.progress.start()
+            self.task_id = self.progress.add_task(desc, total=total, stats="")
+        else:
+            self.progress = tqdm(
+                iterable,
+                desc=desc,
+                total=total,
+                dynamic_ncols=True,
+                disable=disable,
+                leave=leave,
+            )
+
+    def __iter__(self):
+        if self.use_rich:
+            for item in self.iterable:
+                yield item
+                self.progress.advance(self.task_id)
+            return
+
+        yield from self.progress
+
+    def set_postfix(self, stats: dict[str, object]) -> None:
+        if self.use_rich:
+            self.progress.update(self.task_id, stats=_format_progress_stats(stats))
+            return
+
+        if hasattr(self.progress, "set_postfix"):
+            self.progress.set_postfix(stats)
+
+    def close(self) -> None:
+        if self.use_rich:
+            self.progress.stop()
+            return
+
+        if hasattr(self.progress, "close"):
+            self.progress.close()
+
+
+def _make_progress(iterable, desc: str, total: int | None, disable: bool, leave: bool, use_rich: bool):
+    return _ProgressDisplay(iterable=iterable, desc=desc, total=total, disable=disable, leave=leave, use_rich=use_rich)
+
+
+def _print_rich_epoch_header(epoch: int, total_epochs: int, fusion_type: str, use_rich: bool) -> None:
+    if not use_rich:
+        return
+
+    panel = Panel.fit(
+        f"[bold bright_white]Epoch {epoch}/{total_epochs}[/]  [cyan]Fusion[/]: {fusion_type}",
+        border_style="bright_cyan",
+        padding=(0, 2),
+    )
+    RICH_CONSOLE.print(panel)
+
+
+def _print_rich_metrics_panel(title: str, metrics: list[tuple[str, object]], use_rich: bool, border_style: str = "bright_blue") -> None:
+    if not use_rich:
+        return
+
+    table = Table.grid(expand=True)
+    table.add_column(style="bold cyan", justify="left")
+    table.add_column(style="white", justify="right")
+
+    for key, value in metrics:
+        table.add_row(str(key), str(value))
+
+    RICH_CONSOLE.print(Panel(table, title=f"[bold]{title}[/]", border_style=border_style, padding=(0, 1)))
 
 
 def _binarize_with_top1_fallback(y_score: np.ndarray, threshold: float) -> np.ndarray:
@@ -220,6 +344,44 @@ def _print_dataset_summaries(deam_loader, mtg_train_loader, mtg_val_loader) -> N
                 f"(density~{density:.4f})"
             )
 
+
+def _resolve_eval_num_workers(train_num_workers: int, eval_num_workers: int | None) -> int:
+    """Choose a conservative eval worker count on macOS to avoid fd exhaustion."""
+    if eval_num_workers is not None:
+        return max(0, int(eval_num_workers))
+
+    if sys.platform == "darwin" and train_num_workers > 0:
+        return 0
+
+    return max(0, int(train_num_workers))
+
+
+def _shutdown_dataloader_iterator(iterator) -> None:
+    """Best-effort shutdown for multiprocessing DataLoader iterators."""
+    if iterator is None:
+        return
+
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if callable(shutdown):
+        try:
+            shutdown()
+        except Exception:
+            pass
+
+
+def _shutdown_dataloader_loader(loader) -> None:
+    """Best-effort cleanup for persistent DataLoader workers."""
+    if loader is None:
+        return
+
+    iterator = getattr(loader, "_iterator", None)
+    if iterator is not None:
+        _shutdown_dataloader_iterator(iterator)
+        try:
+            loader._iterator = None
+        except Exception:
+            pass
+
 def main():
     # 1. 参数解析
     parser = argparse.ArgumentParser(description="Train the unified mood classification model")
@@ -238,8 +400,11 @@ def main():
     parser.add_argument('--no_progress', action='store_true', help='Disable tqdm progress bars')
     parser.add_argument('--mtg_debug', action='store_true', help='Print extra MTG debug info during validation')
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint file to resume training from')
+    parser.add_argument('--no_auto_resume', action='store_true', help='Disable automatic resume from checkpoint_last.pt if present')
     parser.add_argument('--log_interval', type=int, default=10, help='Log training metrics every N optimizer steps')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of data loading workers for precomputed features (suggest 2-6 on Mac)')
+    parser.add_argument('--eval_num_workers', type=int, default=None, help='Validation/test DataLoader workers; defaults to 0 on macOS, otherwise follows --num_workers')
+    parser.add_argument('--plain_progress', action='store_true', help='Use plain tqdm progress bars instead of the Rich terminal UI')
     parser.add_argument('--compile', action='store_true', help='Use torch.compile for model optimization (requires PyTorch 2.0+)')
     parser.add_argument('--normalize_deam_labels', action='store_true', help='对DEAM标签进行z-score归一化（推荐用于提升训练稳定性）')
 
@@ -257,6 +422,15 @@ def main():
         ]
     )
     logger = logging.getLogger(__name__)
+    rich_ui_enabled = bool(RICH_AVAILABLE and not args.no_progress and not args.plain_progress)
+
+    if not args.no_progress and not args.plain_progress and not RICH_AVAILABLE:
+        logger.info("Rich is not installed; falling back to tqdm progress bars.")
+
+    auto_resume_path = os.path.join(log_dir, "checkpoints", "checkpoint_last.pt")
+    if args.resume is None and not args.no_auto_resume and os.path.isfile(auto_resume_path):
+        args.resume = auto_resume_path
+        logger.info(f"Auto-resume enabled, using checkpoint: {args.resume}")
 
     metrics_header = [
         "epoch",
@@ -297,7 +471,14 @@ def main():
     # 训练前请先运行：python precompute_features.py --dataset all
     logger.info("\n🚀 使用快速模式 (预计算特征)")
     loader_fn = get_dataloader_fast
-    loader_kwargs = {'num_workers': args.num_workers, 'normalize_deam_labels': args.normalize_deam_labels}
+    train_loader_kwargs = {'num_workers': args.num_workers, 'normalize_deam_labels': args.normalize_deam_labels}
+    eval_num_workers = _resolve_eval_num_workers(args.num_workers, args.eval_num_workers)
+    eval_loader_kwargs = {'num_workers': eval_num_workers, 'normalize_deam_labels': args.normalize_deam_labels}
+    if eval_num_workers != args.num_workers:
+        logger.info(
+            f"Using eval_num_workers={eval_num_workers} (train num_workers={args.num_workers}) "
+            "to reduce file descriptor pressure during validation/testing"
+        )
 
     # Load DEAM datasets (train/val/test)
     logger.info("Loading DEAM dataset...")
@@ -307,7 +488,7 @@ def main():
         batch_size=args.batch_size,
         subset_fraction=args.train_pct,
         subset_seed=args.subset_seed,
-        **loader_kwargs,
+        **train_loader_kwargs,
     )
     deam_val_loader = loader_fn(
         "deam",
@@ -316,7 +497,7 @@ def main():
         shuffle=False,
         subset_fraction=args.train_pct,
         subset_seed=args.subset_seed,
-        **loader_kwargs,
+        **eval_loader_kwargs,
     )
     deam_test_loader = loader_fn(
         "deam",
@@ -325,7 +506,7 @@ def main():
         shuffle=False,
         subset_fraction=args.train_pct,
         subset_seed=args.subset_seed,
-        **loader_kwargs,
+        **eval_loader_kwargs,
     )
 
     # Load MTG-Jamendo datasets (train/val/test)
@@ -336,7 +517,7 @@ def main():
         batch_size=args.batch_size,
         subset_fraction=args.train_pct,
         subset_seed=args.subset_seed,
-        **loader_kwargs,
+        **train_loader_kwargs,
     )
     mtg_val_loader = loader_fn(
         "mtg-jamendo",
@@ -345,7 +526,7 @@ def main():
         shuffle=False,
         subset_fraction=args.train_pct,
         subset_seed=args.subset_seed,
-        **loader_kwargs,
+        **eval_loader_kwargs,
     )
     mtg_test_loader = loader_fn(
         "mtg-jamendo",
@@ -354,7 +535,7 @@ def main():
         shuffle=False,
         subset_fraction=args.train_pct,
         subset_seed=args.subset_seed,
-        **loader_kwargs,
+        **eval_loader_kwargs,
     )
 
     num_mtg_tags = len(getattr(mtg_train_loader.dataset, "mood_tags", []))
@@ -460,12 +641,14 @@ def main():
         accumulation_counter = 0
 
         lr = float(optimizer.param_groups[0].get("lr", args.lr))
-        train_pbar = tqdm(
+        _print_rich_epoch_header(epoch + 1, args.epochs, args.fusion_type, use_rich=rich_ui_enabled)
+        train_pbar = _make_progress(
             range(num_batches),
             desc=f"Epoch {epoch+1}/{args.epochs} [train]",
             total=num_batches,
-            dynamic_ncols=True,
             disable=bool(args.no_progress),
+            leave=True,
+            use_rich=rich_ui_enabled,
         )
 
         for batch_idx in train_pbar:
@@ -505,6 +688,8 @@ def main():
 
             except StopIteration:
                 # Reinitialize DEAM iterator if exhausted
+                # Note: do NOT call _shutdown_dataloader_iterator here;
+                # persistent_workers keeps workers alive across iterator resets.
                 deam_iter = iter(deam_train_loader)
                 continue
 
@@ -543,6 +728,8 @@ def main():
 
             except StopIteration:
                 # Reinitialize MTG iterator if exhausted
+                # Note: do NOT call _shutdown_dataloader_iterator here;
+                # persistent_workers keeps workers alive across iterator resets.
                 mtg_iter = iter(mtg_train_loader)
                 continue
 
@@ -564,6 +751,7 @@ def main():
                 cur_loss = running_loss / seen
                 cur_ccc = (deam_ccc / deam_total) if deam_total > 0 else 0.0
                 train_pbar.set_postfix({"loss": f"{cur_loss:.4f}", "deam_ccc": f"{cur_ccc:.3f}", "lr": f"{lr:.1e}"})
+        train_pbar.close()
 
         # Make sure to take the last step if accumulation counter is not zero
         if accumulation_counter > 0:
@@ -599,70 +787,80 @@ def main():
 
         with torch.no_grad():
             # Validate DEAM
-            deam_val_pbar = tqdm(
-                deam_val_loader,
+            deam_val_iter = iter(deam_val_loader)
+            deam_val_pbar = _make_progress(
+                deam_val_iter,
                 desc=f"Epoch {epoch+1}/{args.epochs} [val:DEAM]",
                 total=len(deam_val_loader),
-                dynamic_ncols=True,
-                leave=False,
                 disable=bool(args.no_progress),
+                leave=False,
+                use_rich=rich_ui_enabled,
             )
-            for features, labels, feat_lengths in deam_val_pbar:
-                for key in features:
-                    features[key] = features[key].to(device)
-                labels = labels.to(device)
-                feat_lengths = feat_lengths.to(device)
+            try:
+                for features, labels, feat_lengths in deam_val_pbar:
+                    for key in features:
+                        features[key] = features[key].to(device)
+                    labels = labels.to(device)
+                    feat_lengths = feat_lengths.to(device)
 
-                # Forward pass with automatic mixed precision
-                with autocast_ctx:
-                    outputs = model(features, lengths=feat_lengths)
-                loss, ccc = loss_fn(outputs, labels, task_type='deam')
+                    # Forward pass with automatic mixed precision
+                    with autocast_ctx:
+                        outputs = model(features, lengths=feat_lengths)
+                    loss, ccc = loss_fn(outputs, labels, task_type='deam')
 
-                loss = loss * args.deam_weight
+                    loss = loss * args.deam_weight
 
-                val_loss += loss.item() * features['mel'].size(0)
-                val_deam_total += features['mel'].size(0)
-                if ccc is not None:
-                    val_deam_ccc += ccc.item() * features['mel'].size(0)
+                    val_loss += loss.item() * features['mel'].size(0)
+                    val_deam_total += features['mel'].size(0)
+                    if ccc is not None:
+                        val_deam_ccc += ccc.item() * features['mel'].size(0)
 
-                deam_val_preds.append(outputs['regression'].detach().cpu().float().numpy())
-                deam_val_targets.append(labels.detach().cpu().float().numpy())
+                    deam_val_preds.append(outputs['regression'].detach().cpu().float().numpy())
+                    deam_val_targets.append(labels.detach().cpu().float().numpy())
 
-                if val_deam_total > 0:
-                    deam_val_pbar.set_postfix({"loss": f"{(val_loss / max(1, val_deam_total + val_mtg_total)):.4f}", "ccc": f"{(val_deam_ccc / val_deam_total):.3f}"})
+                    if val_deam_total > 0:
+                        deam_val_pbar.set_postfix({"loss": f"{(val_loss / max(1, val_deam_total + val_mtg_total)):.4f}", "ccc": f"{(val_deam_ccc / val_deam_total):.3f}"})
+            finally:
+                deam_val_pbar.close()
+                _shutdown_dataloader_iterator(deam_val_iter)
 
             # Validate MTG
-            mtg_val_pbar = tqdm(
-                mtg_val_loader,
+            mtg_val_iter = iter(mtg_val_loader)
+            mtg_val_pbar = _make_progress(
+                mtg_val_iter,
                 desc=f"Epoch {epoch+1}/{args.epochs} [val:MTG]",
                 total=len(mtg_val_loader),
-                dynamic_ncols=True,
-                leave=False,
                 disable=bool(args.no_progress),
+                leave=False,
+                use_rich=rich_ui_enabled,
             )
-            for features, labels, feat_lengths in mtg_val_pbar:
-                for key in features:
-                    features[key] = features[key].to(device)
-                labels = labels.to(device)
-                feat_lengths = feat_lengths.to(device)
+            try:
+                for features, labels, feat_lengths in mtg_val_pbar:
+                    for key in features:
+                        features[key] = features[key].to(device)
+                    labels = labels.to(device)
+                    feat_lengths = feat_lengths.to(device)
 
-                # Forward pass with automatic mixed precision
-                with autocast_ctx:
-                    outputs = model(features, lengths=feat_lengths)
-                loss, _ = loss_fn(outputs, labels, task_type='mtg')
+                    # Forward pass with automatic mixed precision
+                    with autocast_ctx:
+                        outputs = model(features, lengths=feat_lengths)
+                    loss, _ = loss_fn(outputs, labels, task_type='mtg')
 
-                loss = loss * args.mtg_weight
+                    loss = loss * args.mtg_weight
 
-                val_loss += loss.item() * features['mel'].size(0)
-                val_mtg_total += features['mel'].size(0)
+                    val_loss += loss.item() * features['mel'].size(0)
+                    val_mtg_total += features['mel'].size(0)
 
-                mtg_logits = outputs['classification'].detach().cpu().float().numpy()
-                mtg_probs = 1.0 / (1.0 + np.exp(-mtg_logits))
-                mtg_val_scores.append(mtg_probs)
-                mtg_val_targets.append(labels.detach().cpu().numpy())
+                    mtg_logits = outputs['classification'].detach().cpu().float().numpy()
+                    mtg_probs = 1.0 / (1.0 + np.exp(-mtg_logits))
+                    mtg_val_scores.append(mtg_probs)
+                    mtg_val_targets.append(labels.detach().cpu().numpy())
 
-                if val_mtg_total > 0:
-                    mtg_val_pbar.set_postfix({"loss": f"{(val_loss / max(1, val_deam_total + val_mtg_total)):.4f}"})
+                    if val_mtg_total > 0:
+                        mtg_val_pbar.set_postfix({"loss": f"{(val_loss / max(1, val_deam_total + val_mtg_total)):.4f}"})
+            finally:
+                mtg_val_pbar.close()
+                _shutdown_dataloader_iterator(mtg_val_iter)
 
         # Calculate validation statistics
         val_epoch_loss = val_loss / (val_deam_total + val_mtg_total) if (val_deam_total + val_mtg_total) > 0 else 0.0
@@ -786,6 +984,23 @@ def main():
             f"{mtg_line}{best_line}"
         )
         logger.info(f"time: epoch={epoch_dt:.1f}s (val={val_dt:.1f}s) lr={lr:.1e}")
+        _print_rich_metrics_panel(
+            title=f"Epoch {epoch+1} Summary",
+            metrics=[
+                ("Train Loss", f"{epoch_loss:.4f}"),
+                ("Train DEAM CCC", f"{avg_deam_ccc:.4f}"),
+                ("Val Loss", f"{val_epoch_loss:.4f}"),
+                ("Val DEAM CCC", f"{val_avg_deam_ccc:.4f}"),
+                ("Val RMSE", f"{deam_rmse:.4f}"),
+                ("Val Pearson", f"{deam_pearson:.4f}"),
+                ("MTG F1 Micro", f"{mtg_m['f1_micro']:.4f}"),
+                ("MTG PR-AUC Micro", f"{mtg_m['pr_auc_micro']:.4f}"),
+                ("Threshold", f"{mtg_threshold:.2f}"),
+                ("Epoch Time", f"{epoch_dt:.1f}s"),
+            ],
+            use_rich=rich_ui_enabled,
+            border_style="bright_blue",
+        )
 
         _append_epoch_metrics(
             metrics_path,
@@ -852,12 +1067,22 @@ def main():
     logger.info("Cleaning up training resources...")
     # Save mood_tags before deleting loader
     mood_tags = getattr(mtg_train_loader.dataset, "mood_tags", None)
-    
+
+    if 'deam_iter' in locals():
+        _shutdown_dataloader_iterator(deam_iter)
+    if 'mtg_iter' in locals():
+        _shutdown_dataloader_iterator(mtg_iter)
+    _shutdown_dataloader_loader(deam_train_loader)
+    _shutdown_dataloader_loader(mtg_train_loader)
+    _shutdown_dataloader_loader(deam_val_loader)
+    _shutdown_dataloader_loader(mtg_val_loader)
+    _shutdown_dataloader_loader(deam_test_loader)
+    _shutdown_dataloader_loader(mtg_test_loader)
+
     if 'deam_train_loader' in locals(): del deam_train_loader
     if 'mtg_train_loader' in locals(): del mtg_train_loader
     if 'deam_val_loader' in locals(): del deam_val_loader
     if 'mtg_val_loader' in locals(): del mtg_val_loader
-    import gc
     gc.collect()
 
     # 9. 测试阶段
@@ -875,46 +1100,76 @@ def main():
 
     with torch.no_grad():
         # Test DEAM
-        for features, labels, feat_lengths in deam_test_loader:
-            for key in features:
-                features[key] = features[key].to(device)
-            labels = labels.to(device)
-            feat_lengths = feat_lengths.to(device)
+        deam_test_iter = iter(deam_test_loader)
+        deam_test_pbar = _make_progress(
+            deam_test_iter,
+            desc="Final test [DEAM]",
+            total=len(deam_test_loader),
+            disable=bool(args.no_progress),
+            leave=False,
+            use_rich=rich_ui_enabled,
+        )
+        try:
+            for features, labels, feat_lengths in deam_test_pbar:
+                for key in features:
+                    features[key] = features[key].to(device)
+                labels = labels.to(device)
+                feat_lengths = feat_lengths.to(device)
 
-            with autocast_ctx:
-                outputs = model(features, lengths=feat_lengths)
-            loss, ccc = loss_fn(outputs, labels, task_type='deam')
+                with autocast_ctx:
+                    outputs = model(features, lengths=feat_lengths)
+                loss, ccc = loss_fn(outputs, labels, task_type='deam')
 
-            loss = loss * args.deam_weight
+                loss = loss * args.deam_weight
 
-            test_loss += loss.item() * features['mel'].size(0)
-            test_deam_total += features['mel'].size(0)
-            if ccc is not None:
-                test_deam_ccc += ccc.item() * features['mel'].size(0)
+                test_loss += loss.item() * features['mel'].size(0)
+                test_deam_total += features['mel'].size(0)
+                if ccc is not None:
+                    test_deam_ccc += ccc.item() * features['mel'].size(0)
 
-            deam_test_preds.append(outputs['regression'].detach().cpu().float().numpy())
-            deam_test_targets.append(labels.detach().cpu().float().numpy())
+                deam_test_preds.append(outputs['regression'].detach().cpu().float().numpy())
+                deam_test_targets.append(labels.detach().cpu().float().numpy())
+                if test_deam_total > 0:
+                    deam_test_pbar.set_postfix({"loss": f"{(test_loss / max(1, test_deam_total + test_mtg_total)):.4f}", "ccc": f"{(test_deam_ccc / test_deam_total):.3f}"})
+        finally:
+            deam_test_pbar.close()
+            _shutdown_dataloader_iterator(deam_test_iter)
 
         # Test MTG
-        for features, labels, feat_lengths in mtg_test_loader:
-            for key in features:
-                features[key] = features[key].to(device)
-            labels = labels.to(device)
-            feat_lengths = feat_lengths.to(device)
+        mtg_test_iter = iter(mtg_test_loader)
+        mtg_test_pbar = _make_progress(
+            mtg_test_iter,
+            desc="Final test [MTG]",
+            total=len(mtg_test_loader),
+            disable=bool(args.no_progress),
+            leave=False,
+            use_rich=rich_ui_enabled,
+        )
+        try:
+            for features, labels, feat_lengths in mtg_test_pbar:
+                for key in features:
+                    features[key] = features[key].to(device)
+                labels = labels.to(device)
+                feat_lengths = feat_lengths.to(device)
 
-            with autocast_ctx:
-                outputs = model(features, lengths=feat_lengths)
-            loss, _ = loss_fn(outputs, labels, task_type='mtg')
+                with autocast_ctx:
+                    outputs = model(features, lengths=feat_lengths)
+                loss, _ = loss_fn(outputs, labels, task_type='mtg')
 
-            loss = loss * args.mtg_weight
+                loss = loss * args.mtg_weight
 
-            test_loss += loss.item() * features['mel'].size(0)
-            test_mtg_total += features['mel'].size(0)
+                test_loss += loss.item() * features['mel'].size(0)
+                test_mtg_total += features['mel'].size(0)
 
-            mtg_logits = outputs['classification'].detach().cpu().float().numpy()
-            mtg_probs = 1.0 / (1.0 + np.exp(-mtg_logits))
-            mtg_test_scores.append(mtg_probs)
-            mtg_test_targets.append(labels.detach().cpu().numpy())
+                mtg_logits = outputs['classification'].detach().cpu().float().numpy()
+                mtg_probs = 1.0 / (1.0 + np.exp(-mtg_logits))
+                mtg_test_scores.append(mtg_probs)
+                mtg_test_targets.append(labels.detach().cpu().numpy())
+                if test_mtg_total > 0:
+                    mtg_test_pbar.set_postfix({"loss": f"{(test_loss / max(1, test_deam_total + test_mtg_total)):.4f}"})
+        finally:
+            mtg_test_pbar.close()
+            _shutdown_dataloader_iterator(mtg_test_iter)
 
     # Calculate test statistics
     test_epoch_loss = test_loss / (test_deam_total + test_mtg_total) if (test_deam_total + test_mtg_total) > 0 else 0.0
@@ -983,6 +1238,20 @@ def main():
             f"R micro/macro: {mtg_m['recall_micro']:.4f}/{mtg_m['recall_macro']:.4f}"
         )
     logger.info("-" * 60)
+    _print_rich_metrics_panel(
+        title="Final Test Summary",
+        metrics=[
+            ("Test Loss", f"{test_epoch_loss:.4f}"),
+            ("Test DEAM CCC", f"{test_avg_deam_ccc:.4f}"),
+            ("Test DEAM RMSE", f"{_rmse_np(deam_pred, deam_tgt):.4f}" if deam_test_preds and deam_test_targets else "nan"),
+            ("Test Pearson", f"{_pearson_np(deam_pred, deam_tgt):.4f}" if deam_test_preds and deam_test_targets else "nan"),
+            ("Test MTG F1 Micro", f"{mtg_m['f1_micro']:.4f}" if mtg_test_scores and mtg_test_targets else "nan"),
+            ("Test MTG PR-AUC Micro", f"{mtg_m['pr_auc_micro']:.4f}" if mtg_test_scores and mtg_test_targets else "nan"),
+            ("Test Threshold", f"{test_threshold:.2f}" if mtg_test_scores and mtg_test_targets else "nan"),
+        ],
+        use_rich=rich_ui_enabled,
+        border_style="green",
+    )
 
     # 10. 模型保存与清理
     model_save_path = f"unified_mood_model_{args.fusion_type}.pt"

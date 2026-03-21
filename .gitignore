@@ -18,3 +18,9 @@ note/
 unified_mood_model_early.pt
 src/models/__init__.py
 src/losses/__init__.py
+thesis_figures
+AGENTS.md
+thesis_results_chapter.md
+methodology_detailed.md
+
+future_work_conclusion.md

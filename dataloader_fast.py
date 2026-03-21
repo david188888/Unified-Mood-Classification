@@ -339,21 +339,23 @@ def collate_fn(batch):
 
     all_features, all_labels = zip(*batch)
 
-    # Find global max length and record per-sample actual lengths
-    max_len = 0
+    # Align features within each sample to minimum length across feature types
+    # (different extractors may produce slightly different frame counts)
+    aligned_features = []
     sample_lengths = []
+    max_len = 0
     for feat_dict in all_features:
-        # Use any feature to determine the sample's actual sequence length
-        sample_len = next(iter(feat_dict.values())).shape[0]
-        sample_lengths.append(sample_len)
-        if sample_len > max_len:
-            max_len = sample_len
+        min_len = min(feat.shape[0] for feat in feat_dict.values())
+        sample_lengths.append(min_len)
+        if min_len > max_len:
+            max_len = min_len
+        aligned_features.append({key: feat[:min_len] for key, feat in feat_dict.items()})
 
     lengths = torch.tensor(sample_lengths, dtype=torch.int32)
 
-    # Stack each feature type
-    for key in all_features[0].keys():
-        features = [feat[key] for feat in all_features]
+    # Stack each feature type, padding to max_len across samples
+    for key in aligned_features[0].keys():
+        features = [feat[key] for feat in aligned_features]
 
         padded_features = []
         for feat in features:
