@@ -42,15 +42,31 @@ class FeatureFusion(nn.Module):
         Returns:
             torch.Tensor: Fused features (shape depends on fusion type)
         """
-        mel = projected_features['mel']  # shape: [B, T, D]
-        chroma = projected_features['chroma']  # shape: [B, T, D]
-        tempogram = projected_features['tempogram']  # shape: [B, T, D]
         mert = projected_features['mert']  # shape: [B, T, D]
 
         if self.fusion_type == 'early':
+            mel = projected_features.get('mel')
+            chroma = projected_features.get('chroma')
+            tempogram = projected_features.get('tempogram')
+
+            if mel is None and chroma is None and tempogram is None:
+                return mert
+
+            def _feature_or_zeros(feature):
+                if feature is None:
+                    return torch.zeros_like(mert)
+                return feature
+
             # Early Fusion with Cross-Attention: MERT as Query, others as Key/Value
             # Concatenate mel, chroma, tempogram along channel dim to form Key/Value
-            other_features = torch.cat([mel, chroma, tempogram], dim=-1)  # [B, T, 3D]
+            other_features = torch.cat(
+                [
+                    _feature_or_zeros(mel),
+                    _feature_or_zeros(chroma),
+                    _feature_or_zeros(tempogram),
+                ],
+                dim=-1,
+            )  # [B, T, 3D]
 
             # Separate projections for Key and Value
             key = self.key_proj(other_features)      # [B, T, D]
@@ -65,12 +81,7 @@ class FeatureFusion(nn.Module):
 
         elif self.fusion_type == 'late':
             # Return all features separately for late fusion
-            return {
-                'mel': mel,
-                'chroma': chroma,
-                'tempogram': tempogram,
-                'mert': mert
-            }
+            return projected_features
 
         else:
             raise ValueError(f"Unknown fusion type: {self.fusion_type}")

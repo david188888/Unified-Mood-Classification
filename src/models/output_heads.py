@@ -55,7 +55,6 @@ class OutputHeads(nn.Module):
         # Regression head (DEAM VA prediction)
         regression_raw = self.regression_head(x_pooled)  # shape: [B, 2]
 
-        # 使用sigmoid约束输出到指定范围
         v_scaled = self.deam_v_min + torch.sigmoid(regression_raw[:, 0]) * \
                    (self.deam_v_max - self.deam_v_min)
         a_scaled = self.deam_a_min + torch.sigmoid(regression_raw[:, 1]) * \

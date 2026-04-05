@@ -9,6 +9,7 @@
 
 import os
 import json
+from functools import partial
 import torch
 import torchaudio
 import torchaudio.transforms as T
@@ -74,14 +75,6 @@ def load_mert_model(model_dir):
 class DEAMDatasetCached(Dataset):
     """DEAM Dataset - 从预计算缓存加载特征（快速版）"""
 
-    # 训练集标签统计（基于DEAM数据集实际统计）
-    LABEL_STATS = {
-        'valence_mean': 5.0,
-        'valence_std': 1.5,
-        'arousal_mean': 5.0,
-        'arousal_std': 1.5,
-    }
-
     def __init__(
         self,
         split="train",
@@ -90,11 +83,9 @@ class DEAMDatasetCached(Dataset):
         subset_fraction: float = 1.0,
         subset_seed: int | None = None,
         apply_augment: bool = True,
-        normalize_labels: bool = False,
     ):
         self.split = split
         self.apply_augment = apply_augment and (split == "train")
-        self.normalize_labels = normalize_labels
         base_dir = os.path.dirname(os.path.abspath(__file__))
 
         self.label_path = label_path or os.path.join(
@@ -179,30 +170,12 @@ class DEAMDatasetCached(Dataset):
         valence, arousal = self.labels[audio_id]
         label = torch.tensor([valence, arousal], dtype=torch.float32)
 
-        # 标签归一化（z-score）
-        if self.normalize_labels:
-            label = self._normalize_label(label)
-
         return {
             "mert": mert,
             "mel": mel,
             "chroma": chroma,
             "tempogram": tempogram
         }, label
-
-    def _normalize_label(self, label):
-        """对标签进行z-score归一化"""
-        stats = self.LABEL_STATS
-        valence_norm = (label[0] - stats['valence_mean']) / stats['valence_std']
-        arousal_norm = (label[1] - stats['arousal_mean']) / stats['arousal_std']
-        return torch.tensor([valence_norm, arousal_norm], dtype=torch.float32)
-
-    def denormalize_label(self, label):
-        """反归一化标签（用于评估）"""
-        stats = self.LABEL_STATS
-        valence = label[0] * stats['valence_std'] + stats['valence_mean']
-        arousal = label[1] * stats['arousal_std'] + stats['arousal_mean']
-        return torch.tensor([valence, arousal], dtype=torch.float32)
 
 
 class MTGJamendoDatasetCached(Dataset):
@@ -328,7 +301,7 @@ class MTGJamendoDatasetCached(Dataset):
         }, label
 
 
-def collate_fn(batch):
+def collate_fn(batch, enabled_features=None):
     """Collate function to handle variable-length sequences.
 
     Returns:
@@ -338,6 +311,13 @@ def collate_fn(batch):
     features_batch = {}
 
     all_features, all_labels = zip(*batch)
+
+    if enabled_features is not None:
+        enabled = set(enabled_features)
+        all_features = tuple(
+            {key: value for key, value in feat_dict.items() if key in enabled}
+            for feat_dict in all_features
+        )
 
     # Align features within each sample to minimum length across feature types
     # (different extractors may produce slightly different frame counts)
@@ -378,7 +358,7 @@ def collate_fn(batch):
 
 def get_dataloader_fast(dataset_name, split="train", batch_size=8, shuffle=True,
                         num_workers=4, prefetch_factor=2, pin_memory=True,
-                        normalize_deam_labels: bool = False, **kwargs):
+                        enabled_features=None, **kwargs):
     """获取优化后的数据加载器（使用预计算特征）
 
     Args:
@@ -389,11 +369,10 @@ def get_dataloader_fast(dataset_name, split="train", batch_size=8, shuffle=True,
         num_workers: 数据加载进程数（推荐 2-4）
         prefetch_factor: 每个 worker 预取的批次数
         pin_memory: 是否将数据固定在内存（加速 GPU 传输）
-        normalize_deam_labels: 是否对DEAM标签进行z-score归一化
         **kwargs: 其他参数传递给 Dataset
     """
     if dataset_name == "deam":
-        dataset = DEAMDatasetCached(split=split, normalize_labels=normalize_deam_labels, **kwargs)
+        dataset = DEAMDatasetCached(split=split, **kwargs)
     elif dataset_name == "mtg-jamendo":
         dataset = MTGJamendoDatasetCached(split=split, **kwargs)
     else:
@@ -405,7 +384,7 @@ def get_dataloader_fast(dataset_name, split="train", batch_size=8, shuffle=True,
         'batch_size': batch_size,
         'shuffle': shuffle,
         'num_workers': num_workers,
-        'collate_fn': collate_fn,
+        'collate_fn': partial(collate_fn, enabled_features=enabled_features),
         'pin_memory': pin_memory if torch.cuda.is_available() else False,
         'persistent_workers': (num_workers > 0) and (split == 'train'),
     }

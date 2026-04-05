@@ -44,6 +44,7 @@ except Exception:  # pragma: no cover
 
 
 RICH_CONSOLE = Console(stderr=True, soft_wrap=True) if RICH_AVAILABLE else None
+FEATURE_ORDER = ("mert", "mel", "chroma", "tempogram")
 
 
 def _format_progress_stats(stats: dict[str, object] | None) -> str:
@@ -54,6 +55,42 @@ def _format_progress_stats(stats: dict[str, object] | None) -> str:
     for key, value in stats.items():
         parts.append(f"{key}={value}")
     return " | ".join(parts)
+
+
+def _parse_enabled_features(raw_value: str | None) -> tuple[str, ...]:
+    if raw_value is None:
+        return FEATURE_ORDER
+
+    tokens = [part.strip().lower() for part in raw_value.split(",") if part.strip()]
+    if not tokens:
+        raise ValueError("--enabled_features cannot be empty")
+
+    unknown = [token for token in tokens if token not in FEATURE_ORDER]
+    if unknown:
+        raise ValueError(
+            f"Unknown feature(s): {unknown}. Allowed values: {', '.join(FEATURE_ORDER)}"
+        )
+
+    normalized = tuple(feature for feature in FEATURE_ORDER if feature in tokens)
+    if not normalized:
+        raise ValueError("--enabled_features must enable at least one feature")
+
+    return normalized
+
+
+def _validate_enabled_features(fusion_type: str, enabled_features: tuple[str, ...]) -> None:
+    if fusion_type == "early" and "mert" not in enabled_features:
+        raise ValueError("Early fusion ablations must include 'mert'")
+    if fusion_type == "late" and enabled_features != FEATURE_ORDER:
+        raise ValueError("Late fusion currently requires the full feature set")
+
+
+def _filter_enabled_features(features: dict[str, torch.Tensor], enabled_features: tuple[str, ...]) -> dict[str, torch.Tensor]:
+    return {key: value for key, value in features.items() if key in enabled_features}
+
+
+def _batch_size_from_features(features: dict[str, torch.Tensor]) -> int:
+    return next(iter(features.values())).size(0)
 
 
 class _ProgressDisplay:
@@ -406,9 +443,12 @@ def main():
     parser.add_argument('--eval_num_workers', type=int, default=None, help='Validation/test DataLoader workers; defaults to 0 on macOS, otherwise follows --num_workers')
     parser.add_argument('--plain_progress', action='store_true', help='Use plain tqdm progress bars instead of the Rich terminal UI')
     parser.add_argument('--compile', action='store_true', help='Use torch.compile for model optimization (requires PyTorch 2.0+)')
-    parser.add_argument('--normalize_deam_labels', action='store_true', help='对DEAM标签进行z-score归一化（推荐用于提升训练稳定性）')
+    parser.add_argument('--enabled_features', type=str, default=",".join(FEATURE_ORDER),
+                        help='Comma-separated feature subset. Allowed: mert,mel,chroma,tempogram')
 
     args = parser.parse_args()
+    args.enabled_features = _parse_enabled_features(args.enabled_features)
+    _validate_enabled_features(args.fusion_type, args.enabled_features)
 
     # Setup logging
     log_dir = f"runs/unified_mood_model_{args.fusion_type}"
@@ -470,10 +510,11 @@ def main():
     # 始终使用快速模式（预计算特征）。
     # 训练前请先运行：python precompute_features.py --dataset all
     logger.info("\n🚀 使用快速模式 (预计算特征)")
+    logger.info(f"Enabled features: {', '.join(args.enabled_features)}")
     loader_fn = get_dataloader_fast
-    train_loader_kwargs = {'num_workers': args.num_workers, 'normalize_deam_labels': args.normalize_deam_labels}
+    train_loader_kwargs = {'num_workers': args.num_workers, 'enabled_features': args.enabled_features}
     eval_num_workers = _resolve_eval_num_workers(args.num_workers, args.eval_num_workers)
-    eval_loader_kwargs = {'num_workers': eval_num_workers, 'normalize_deam_labels': args.normalize_deam_labels}
+    eval_loader_kwargs = {'num_workers': eval_num_workers, 'enabled_features': args.enabled_features}
     if eval_num_workers != args.num_workers:
         logger.info(
             f"Using eval_num_workers={eval_num_workers} (train num_workers={args.num_workers}) "
@@ -661,6 +702,8 @@ def main():
                     deam_features[key] = deam_features[key].to(device)
                 deam_labels = deam_labels.to(device)
                 deam_lengths = deam_lengths.to(device)
+                deam_features = _filter_enabled_features(deam_features, args.enabled_features)
+                deam_batch_size = _batch_size_from_features(deam_features)
 
                 # Forward pass with automatic mixed precision
                 with autocast_ctx:
@@ -678,10 +721,10 @@ def main():
                 loss.backward()
 
                 # Update statistics
-                running_loss += (loss.item() * args.accumulation_steps) * deam_features['mel'].size(0)
-                deam_total += deam_features['mel'].size(0)
+                running_loss += (loss.item() * args.accumulation_steps) * deam_batch_size
+                deam_total += deam_batch_size
                 if ccc is not None:
-                    deam_ccc += ccc.item() * deam_features['mel'].size(0)
+                    deam_ccc += ccc.item() * deam_batch_size
 
                 # Update accumulation counter
                 accumulation_counter += 1
@@ -702,6 +745,8 @@ def main():
                     mtg_features[key] = mtg_features[key].to(device)
                 mtg_labels = mtg_labels.to(device)
                 mtg_lengths = mtg_lengths.to(device)
+                mtg_features = _filter_enabled_features(mtg_features, args.enabled_features)
+                mtg_batch_size = _batch_size_from_features(mtg_features)
 
                 # Forward pass with automatic mixed precision
                 with autocast_ctx:
@@ -720,8 +765,8 @@ def main():
                 loss.backward()
 
                 # Update statistics
-                running_loss += (loss.item() * args.accumulation_steps) * mtg_features['mel'].size(0)
-                mtg_total += mtg_features['mel'].size(0)
+                running_loss += (loss.item() * args.accumulation_steps) * mtg_batch_size
+                mtg_total += mtg_batch_size
 
                 # Update accumulation counter
                 accumulation_counter += 1
@@ -802,6 +847,8 @@ def main():
                         features[key] = features[key].to(device)
                     labels = labels.to(device)
                     feat_lengths = feat_lengths.to(device)
+                    features = _filter_enabled_features(features, args.enabled_features)
+                    batch_size = _batch_size_from_features(features)
 
                     # Forward pass with automatic mixed precision
                     with autocast_ctx:
@@ -810,10 +857,10 @@ def main():
 
                     loss = loss * args.deam_weight
 
-                    val_loss += loss.item() * features['mel'].size(0)
-                    val_deam_total += features['mel'].size(0)
+                    val_loss += loss.item() * batch_size
+                    val_deam_total += batch_size
                     if ccc is not None:
-                        val_deam_ccc += ccc.item() * features['mel'].size(0)
+                        val_deam_ccc += ccc.item() * batch_size
 
                     deam_val_preds.append(outputs['regression'].detach().cpu().float().numpy())
                     deam_val_targets.append(labels.detach().cpu().float().numpy())
@@ -840,6 +887,8 @@ def main():
                         features[key] = features[key].to(device)
                     labels = labels.to(device)
                     feat_lengths = feat_lengths.to(device)
+                    features = _filter_enabled_features(features, args.enabled_features)
+                    batch_size = _batch_size_from_features(features)
 
                     # Forward pass with automatic mixed precision
                     with autocast_ctx:
@@ -848,8 +897,8 @@ def main():
 
                     loss = loss * args.mtg_weight
 
-                    val_loss += loss.item() * features['mel'].size(0)
-                    val_mtg_total += features['mel'].size(0)
+                    val_loss += loss.item() * batch_size
+                    val_mtg_total += batch_size
 
                     mtg_logits = outputs['classification'].detach().cpu().float().numpy()
                     mtg_probs = 1.0 / (1.0 + np.exp(-mtg_logits))
@@ -881,15 +930,6 @@ def main():
         if deam_val_preds and deam_val_targets:
             deam_pred = np.concatenate(deam_val_preds, axis=0)
             deam_tgt = np.concatenate(deam_val_targets, axis=0)
-
-            # 如果使用了标签归一化，反归一化到原始范围
-            if args.normalize_deam_labels:
-                from dataloader_fast import DEAMDatasetCached
-                stats = DEAMDatasetCached.LABEL_STATS
-                deam_pred[:, 0] = deam_pred[:, 0] * stats['valence_std'] + stats['valence_mean']
-                deam_pred[:, 1] = deam_pred[:, 1] * stats['arousal_std'] + stats['arousal_mean']
-                deam_tgt[:, 0] = deam_tgt[:, 0] * stats['valence_std'] + stats['valence_mean']
-                deam_tgt[:, 1] = deam_tgt[:, 1] * stats['arousal_std'] + stats['arousal_mean']
 
             deam_ccc_per_dim = _ccc_np_per_dim(deam_pred, deam_tgt)
             deam_rmse = _rmse_np(deam_pred, deam_tgt)
@@ -1046,6 +1086,7 @@ def main():
             'fusion_type': args.fusion_type,
             'num_mtg_tags': num_mtg_tags,
             'mood_tags': getattr(mtg_train_loader.dataset, "mood_tags", None),
+            'enabled_features': args.enabled_features,
             'args': vars(args),
         }
 
@@ -1115,6 +1156,8 @@ def main():
                     features[key] = features[key].to(device)
                 labels = labels.to(device)
                 feat_lengths = feat_lengths.to(device)
+                features = _filter_enabled_features(features, args.enabled_features)
+                batch_size = _batch_size_from_features(features)
 
                 with autocast_ctx:
                     outputs = model(features, lengths=feat_lengths)
@@ -1122,10 +1165,10 @@ def main():
 
                 loss = loss * args.deam_weight
 
-                test_loss += loss.item() * features['mel'].size(0)
-                test_deam_total += features['mel'].size(0)
+                test_loss += loss.item() * batch_size
+                test_deam_total += batch_size
                 if ccc is not None:
-                    test_deam_ccc += ccc.item() * features['mel'].size(0)
+                    test_deam_ccc += ccc.item() * batch_size
 
                 deam_test_preds.append(outputs['regression'].detach().cpu().float().numpy())
                 deam_test_targets.append(labels.detach().cpu().float().numpy())
@@ -1151,6 +1194,8 @@ def main():
                     features[key] = features[key].to(device)
                 labels = labels.to(device)
                 feat_lengths = feat_lengths.to(device)
+                features = _filter_enabled_features(features, args.enabled_features)
+                batch_size = _batch_size_from_features(features)
 
                 with autocast_ctx:
                     outputs = model(features, lengths=feat_lengths)
@@ -1158,8 +1203,8 @@ def main():
 
                 loss = loss * args.mtg_weight
 
-                test_loss += loss.item() * features['mel'].size(0)
-                test_mtg_total += features['mel'].size(0)
+                test_loss += loss.item() * batch_size
+                test_mtg_total += batch_size
 
                 mtg_logits = outputs['classification'].detach().cpu().float().numpy()
                 mtg_probs = 1.0 / (1.0 + np.exp(-mtg_logits))
@@ -1182,15 +1227,6 @@ def main():
     if deam_test_preds and deam_test_targets:
         deam_pred = np.concatenate(deam_test_preds, axis=0)
         deam_tgt = np.concatenate(deam_test_targets, axis=0)
-
-        # 如果使用了标签归一化，反归一化到原始范围
-        if args.normalize_deam_labels:
-            from dataloader_fast import DEAMDatasetCached
-            stats = DEAMDatasetCached.LABEL_STATS
-            deam_pred[:, 0] = deam_pred[:, 0] * stats['valence_std'] + stats['valence_mean']
-            deam_pred[:, 1] = deam_pred[:, 1] * stats['arousal_std'] + stats['arousal_mean']
-            deam_tgt[:, 0] = deam_tgt[:, 0] * stats['valence_std'] + stats['valence_mean']
-            deam_tgt[:, 1] = deam_tgt[:, 1] * stats['arousal_std'] + stats['arousal_mean']
 
         deam_ccc_per_dim = _ccc_np_per_dim(deam_pred, deam_tgt)
         writer.add_scalar('Test/DEAM_RMSE', _rmse_np(deam_pred, deam_tgt), optimizer_step)
@@ -1261,6 +1297,7 @@ def main():
         "fusion_type": args.fusion_type,
         "num_mtg_tags": num_mtg_tags,
         "mood_tags": mood_tags,
+        "enabled_features": args.enabled_features,
         "best_mtg_threshold": best_mtg_threshold,
         "best_mtg_val_f1_micro": best_mtg_val_f1_micro,
         "best_mtg_epoch": best_mtg_epoch,

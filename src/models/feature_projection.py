@@ -74,26 +74,19 @@ class FeatureProjection(nn.Module):
         Returns:
             dict: Projected features in common latent space
         """
-        mel = features['mel']  # shape: [B, T, mel_in_dim]
-        chroma = features['chroma']  # shape: [B, T, chroma_in_dim]
-        tempogram = features['tempogram']  # shape: [B, T, tempogram_in_dim]
-        mert = features['mert']  # shape: [B, T, mert_in_dim]
+        projected = {}
 
-        # Mel: need to permute for CNN (batch, channel, time)
-        mel_proj = self.mel_proj(mel.permute(0, 2, 1)).permute(0, 2, 1)  # shape: [B, T, hidden_dim]
+        if 'mel' in features:
+            mel = features['mel']  # shape: [B, T, mel_in_dim]
+            projected['mel'] = self.mel_proj(mel.permute(0, 2, 1)).permute(0, 2, 1)
 
-        # Chroma: linear projection
-        chroma_proj = self.chroma_proj(chroma)  # shape: [B, T, hidden_dim]
+        if 'chroma' in features:
+            projected['chroma'] = self.chroma_proj(features['chroma'])
 
-        # Tempogram: linear projection
-        tempogram_proj = self.tempogram_proj(tempogram)  # shape: [B, T, hidden_dim]
+        if 'tempogram' in features:
+            projected['tempogram'] = self.tempogram_proj(features['tempogram'])
 
-        # MERT: linear projection
-        mert_proj = self.mert_proj(mert)  # shape: [B, T, hidden_dim]
+        if 'mert' in features:
+            projected['mert'] = self.mert_proj(features['mert'])
 
-        return {
-            'mel': mel_proj,
-            'chroma': chroma_proj,
-            'tempogram': tempogram_proj,
-            'mert': mert_proj
-        }
+        return projected

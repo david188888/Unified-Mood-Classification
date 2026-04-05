@@ -423,10 +423,12 @@ python train.py --train_pct 0.1 --subset_seed 42 --epochs 2
 python train.py --resume runs/unified_mood_model_early/checkpoints/checkpoint_last.pt
 ```
 
-启用标签归一化：
+Early 特征贡献消融示例：
 
 ```bash
-python train.py --normalize_deam_labels
+python train.py --fusion_type early --enabled_features mert
+python train.py --fusion_type early --enabled_features mert,mel
+python train.py --fusion_type early --enabled_features mert,mel,chroma
 ```
 
 ### 6.4 查看训练曲线
@@ -451,5 +453,4 @@ precompute_features.py    # 特征预计算脚本
 generate_mtg_csv.py       # MTG 标签文件生成脚本
 train.py                  # 训练、验证、测试主流程
 ```
-
 

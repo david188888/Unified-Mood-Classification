@@ -9,6 +9,19 @@ from typing import Dict
 import numpy as np
 import matplotlib.pyplot as plt
 
+SCIENTIFIC_COLORS = {
+    "train": "#2878B5",
+    "val": "#C82423",
+    "ccc": "#2878B5",
+    "valence": "#9AC9DB",
+    "arousal": "#C82423",
+    "pearson": "#F8AC8C",
+    "rmse": "#FFBE7A",
+    "f1": "#2878B5",
+    "pr": "#FFBE7A",
+    "roc": "#59A14F",
+}
+
 
 def _read_metrics(path: str) -> Dict[str, np.ndarray]:
     with open(path, newline="") as f:
@@ -48,8 +61,8 @@ def _save_figure(fig: plt.Figure, out_dir: str, name: str) -> None:
 def _plot_loss(data: Dict[str, np.ndarray]) -> plt.Figure:
     epochs = data["epoch"]
     fig, ax = plt.subplots(figsize=(6.4, 4.0))
-    ax.plot(epochs, data.get("train_loss", np.array([])), label="Train Loss")
-    ax.plot(epochs, data.get("val_loss", np.array([])), label="Val Loss")
+    ax.plot(epochs, data.get("train_loss", np.array([])), label="Train Loss", color=SCIENTIFIC_COLORS["train"], linewidth=2.0)
+    ax.plot(epochs, data.get("val_loss", np.array([])), label="Val Loss", color=SCIENTIFIC_COLORS["val"], linewidth=2.0)
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
     ax.legend()
@@ -63,21 +76,21 @@ def _plot_deam(data: Dict[str, np.ndarray]) -> plt.Figure:
 
     ax = axes[0]
     series = [
-        ("val_deam_ccc_epoch", "CCC (mean)"),
-        ("val_deam_ccc_valence", "CCC (valence)"),
-        ("val_deam_ccc_arousal", "CCC (arousal)"),
-        ("val_deam_pearson", "Pearson"),
+        ("val_deam_ccc_epoch", "CCC (mean)", SCIENTIFIC_COLORS["ccc"]),
+        ("val_deam_ccc_valence", "CCC (valence)", SCIENTIFIC_COLORS["valence"]),
+        ("val_deam_ccc_arousal", "CCC (arousal)", SCIENTIFIC_COLORS["arousal"]),
+        ("val_deam_pearson", "Pearson", SCIENTIFIC_COLORS["pearson"]),
     ]
-    for key, label in series:
+    for key, label, color in series:
         if key in data:
-            ax.plot(epochs, data[key], label=label)
+            ax.plot(epochs, data[key], label=label, color=color, linewidth=2.0)
     ax.set_ylabel("Correlation")
     ax.legend(ncol=2, fontsize=9)
     ax.grid(True, alpha=0.3)
 
     ax = axes[1]
     if "val_deam_rmse" in data:
-        ax.plot(epochs, data["val_deam_rmse"], label="RMSE")
+        ax.plot(epochs, data["val_deam_rmse"], label="RMSE", color=SCIENTIFIC_COLORS["rmse"], linewidth=2.0)
     ax.set_xlabel("Epoch")
     ax.set_ylabel("RMSE")
     ax.grid(True, alpha=0.3)
@@ -89,13 +102,13 @@ def _plot_mtg(data: Dict[str, np.ndarray]) -> plt.Figure:
     epochs = data["epoch"]
     fig, ax = plt.subplots(figsize=(6.4, 4.0))
     series = [
-        ("mtg_f1_micro", "F1 micro"),
-        ("mtg_pr_auc_micro", "PR-AUC micro"),
-        ("mtg_roc_auc_micro", "ROC-AUC micro"),
+        ("mtg_f1_micro", "F1 micro", SCIENTIFIC_COLORS["f1"]),
+        ("mtg_pr_auc_micro", "PR-AUC micro", SCIENTIFIC_COLORS["pr"]),
+        ("mtg_roc_auc_micro", "ROC-AUC micro", SCIENTIFIC_COLORS["roc"]),
     ]
-    for key, label in series:
+    for key, label, color in series:
         if key in data:
-            ax.plot(epochs, data[key], label=label)
+            ax.plot(epochs, data[key], label=label, color=color, linewidth=2.0)
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Score")
     ax.legend()

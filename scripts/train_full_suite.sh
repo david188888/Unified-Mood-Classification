@@ -160,9 +160,11 @@ ensure_precomputed_features
 run_experiment early_baseline early
 run_experiment late_baseline late
 
-# Extra ablations currently supported by train.py without changing Python code.
-run_experiment early_norm_deam_labels early --normalize_deam_labels
-run_experiment late_norm_deam_labels late --normalize_deam_labels
+# Early-fusion feature contribution ablations.
+run_experiment early_ablation_mert_only early --enabled_features mert
+run_experiment early_ablation_mert_mel early --enabled_features mert,mel
+run_experiment early_ablation_mert_mel_chroma early --enabled_features mert,mel,chroma
+run_experiment early_ablation_full early --enabled_features mert,mel,chroma,tempogram
 
 log "All experiments finished. Collected outputs under: $SUITE_DIR"
 log "You can inspect TensorBoard logs inside each experiment directory."
