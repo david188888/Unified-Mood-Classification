@@ -420,7 +420,7 @@ def _shutdown_dataloader_loader(loader) -> None:
             pass
 
 def main():
-    # 1. 参数解析
+    # 1. Parse arguments
     parser = argparse.ArgumentParser(description="Train the unified mood classification model")
     parser.add_argument('--fusion_type', type=str, default='early', choices=['early', 'late'], help='Feature fusion type')
     parser.add_argument('--hidden_dim', type=int, default=512, help='Hidden dimension size')
@@ -499,17 +499,17 @@ def main():
     _ensure_metrics_header(metrics_path, metrics_header)
     logger.info(f"Epoch metrics will be saved to: {metrics_path}")
 
-    # 2. 设备配置（mac 优先使用 MPS）
+    # 2. Configure device (prefer MPS on macOS)
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
     use_amp = device.type == "mps"
     autocast_ctx = torch.amp.autocast(device_type="mps", dtype=torch.float16) if use_amp else nullcontext()
     
-    # 3. 数据加载
-    # 始终使用快速模式（预计算特征）。
-    # 训练前请先运行：python precompute_features.py --dataset all
-    logger.info("\n🚀 使用快速模式 (预计算特征)")
+    # 3. Load data
+    # Always use the fast path with precomputed features.
+    # Run this before training: python precompute_features.py --dataset all
+    logger.info("\n🚀 Using fast mode (precomputed features)")
     logger.info(f"Enabled features: {', '.join(args.enabled_features)}")
     loader_fn = get_dataloader_fast
     train_loader_kwargs = {'num_workers': args.num_workers, 'enabled_features': args.enabled_features}
@@ -585,7 +585,7 @@ def main():
 
     _print_dataset_summaries(deam_train_loader, mtg_train_loader, mtg_val_loader)
 
-    # 4. 模型初始化
+    # 4. Initialize model
     logger.info("Initializing model...")
     model = UnifiedMoodModel(
         fusion_type=args.fusion_type,
@@ -598,21 +598,21 @@ def main():
     )
     model = model.to(device)  # Use full precision, let AMP handle automatic mixed precision
 
-    # 可选: 使用 torch.compile 加速 (PyTorch 2.0+)
+    # Optional: accelerate with torch.compile (PyTorch 2.0+)
     if args.compile:
         logger.info("Compiling model with torch.compile...")
         try:
-            # 注意: MPS 后端对 torch.compile 支持有限，使用 'reduce-overhead' 模式
+            # Note: torch.compile support on MPS is limited; use 'reduce-overhead' mode
             model = torch.compile(model, mode='reduce-overhead')
             logger.info("✅ Model compiled successfully")
         except Exception as e:
             logger.info(f"⚠️ torch.compile failed, using eager mode: {e}")
 
-    # 5. 损失函数与优化器
+    # 5. Initialize loss function and optimizer
     loss_fn = MultitaskLoss().to(device)  # Move loss to device
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
 
-    # 6. TensorBoard 初始化
+    # 6. Initialize TensorBoard
     # log_dir is already defined above
     writer = SummaryWriter(log_dir)
     logger.info(f"TensorBoard logs will be saved to: {log_dir}")
@@ -663,7 +663,7 @@ def main():
         else:
             logger.info(f"Warning: Checkpoint not found at '{args.resume}', starting from scratch.")
 
-    # 7. 训练循环
+    # 7. Training loop
     logger.info(f"Starting training with {args.epochs} epochs (from epoch {start_epoch + 1})...")
     for epoch in range(start_epoch, args.epochs):
         epoch_t0 = time.perf_counter()
@@ -673,7 +673,7 @@ def main():
         mtg_total = 0
         deam_ccc = 0.0
 
-        # 交替训练两个数据集
+        # Alternate between the two datasets
         deam_iter = iter(deam_train_loader)
         mtg_iter = iter(mtg_train_loader)
         num_batches = max(len(deam_train_loader), len(mtg_train_loader))
@@ -693,7 +693,7 @@ def main():
         )
 
         for batch_idx in train_pbar:
-            # 训练DEAM batch
+            # Train on a DEAM batch
             try:
                 deam_features, deam_labels, deam_lengths = next(deam_iter)
 
@@ -736,7 +736,7 @@ def main():
                 deam_iter = iter(deam_train_loader)
                 continue
 
-            # 训练MTG batch
+            # Train on an MTG batch
             try:
                 mtg_features, mtg_labels, mtg_lengths = next(mtg_iter)
 
@@ -816,7 +816,7 @@ def main():
         writer.add_scalar('Training/Loss_epoch', epoch_loss, epoch)
         writer.add_scalar('Training/DEAM_CCC_epoch', avg_deam_ccc, epoch)
 
-        # 8. 验证循环
+        # 8. Validation loop
         model.eval()
         val_t0 = time.perf_counter()
 
@@ -1126,7 +1126,7 @@ def main():
     if 'mtg_val_loader' in locals(): del mtg_val_loader
     gc.collect()
 
-    # 9. 测试阶段
+    # 9. Final testing
     logger.info("\nStarting final testing...")
     model.eval()
     test_loss = 0.0
@@ -1289,7 +1289,7 @@ def main():
         border_style="green",
     )
 
-    # 10. 模型保存与清理
+    # 10. Save model and clean up
     model_save_path = f"unified_mood_model_{args.fusion_type}.pt"
     # mood_tags is already saved above before cleanup
     ckpt = {

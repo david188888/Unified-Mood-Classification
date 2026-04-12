@@ -1,11 +1,11 @@
 #!/usr/bin/env python
-"""预计算 MERT 特征并保存到磁盘，避免训练时重复提取。
+"""Precompute MERT-based features and save them to disk to avoid repeated extraction during training.
 
-用法:
+Usage:
     python precompute_features.py --dataset deam --output_dir data/features/deam
     python precompute_features.py --dataset mtg-jamendo --output_dir data/features/mtg
 
-这会显著加速训练，因为 MERT 模型推理是最大的瓶颈。
+This significantly speeds up training because MERT inference is the main bottleneck.
 """
 
 import argparse
@@ -23,7 +23,7 @@ from pathlib import Path
 
 
 def load_mert_model(model_dir, device):
-    """加载 MERT 模型"""
+    """Load the MERT model."""
     processor = Wav2Vec2FeatureExtractor.from_pretrained(model_dir, trust_remote_code=True)
     model = AutoModel.from_pretrained(model_dir, trust_remote_code=True)
     model = model.to(device)
@@ -32,12 +32,12 @@ def load_mert_model(model_dir, device):
 
 
 def extract_features_for_audio(audio_path, processor, model, device, segment_duration=5, num_segments=3):
-    """提取单个音频的所有特征"""
-    # 加载音频
+    """Extract all features for a single audio file."""
+    # Load audio
     waveform, sample_rate = librosa.load(audio_path, sr=None, mono=True)
     waveform = torch.tensor(waveform).unsqueeze(0)
     
-    # 重采样到 24kHz
+    # Resample to 24 kHz
     if sample_rate != 24000:
         resampler = T.Resample(sample_rate, 24000)
         waveform = resampler(waveform)
@@ -45,9 +45,9 @@ def extract_features_for_audio(audio_path, processor, model, device, segment_dur
     segment_samples = segment_duration * 24000
     audio_length = waveform.shape[-1]
     
-    # 提取 num_segments 个随机片段 (使用固定种子以保证一致性)
+    # Extract num_segments random chunks using a fixed seed for consistency
     segments = []
-    # 注意：Python 的 hash() 默认会随机化（不同进程/不同运行结果可能不同），这里用稳定哈希保证可复现。
+    # Python's built-in hash() is randomized across processes/runs, so use a stable hash here.
     seed = int(hashlib.md5(audio_path.encode("utf-8")).hexdigest()[:8], 16)
     np.random.seed(seed)
     
@@ -62,14 +62,14 @@ def extract_features_for_audio(audio_path, processor, model, device, segment_dur
     
     waveform = torch.cat(segments, dim=1)
     
-    # 提取 MERT 特征
+    # Extract MERT features
     with torch.no_grad():
         inputs = processor(waveform.squeeze(0).numpy(), sampling_rate=24000, return_tensors="pt", padding=False)
         inputs = {k: v.to(device) for k, v in inputs.items()}
         outputs = model(**inputs, output_hidden_states=True)
-        mert = outputs.hidden_states[11].squeeze(0).cpu()  # 只用 layer 11
+        mert = outputs.hidden_states[11].squeeze(0).cpu()  # Use layer 11 only
     
-    # 提取 Mel 特征
+    # Extract mel features
     mel_transform = T.MelSpectrogram(
         sample_rate=24000,
         hop_length=320,
@@ -81,12 +81,12 @@ def extract_features_for_audio(audio_path, processor, model, device, segment_dur
     mel = torch.log(mel + 1e-9)
     mel = mel.transpose(1, 0)  # [Time, n_mels]
     
-    # 提取 Chroma
+    # Extract chroma features
     waveform_np = waveform.squeeze(0).numpy()
     chroma = librosa.feature.chroma_cqt(y=waveform_np, sr=24000, hop_length=320)
     chroma = torch.tensor(chroma, dtype=torch.float32).transpose(1, 0)
     
-    # 提取 Tempogram
+    # Extract tempogram features
     tempogram = librosa.feature.tempogram(y=waveform_np, sr=24000, hop_length=320)
     tempogram = torch.tensor(tempogram, dtype=torch.float32).transpose(1, 0)
     
@@ -99,7 +99,7 @@ def extract_features_for_audio(audio_path, processor, model, device, segment_dur
 
 
 def precompute_deam(output_dir, model_dir, device):
-    """预计算 DEAM 数据集的特征"""
+    """Precompute features for the DEAM dataset."""
     base_dir = os.path.dirname(os.path.abspath(__file__))
     audio_root = os.path.join(base_dir, "data", "DEAM", "audio")
     split_path = os.path.join(base_dir, "data", "DEAM", "deam_split.json")
@@ -116,42 +116,42 @@ def precompute_deam(output_dir, model_dir, device):
         all_ids.extend(split_data[split])
     all_ids = list(set(all_ids))
     
-    print(f"预计算 DEAM 数据集 ({len(all_ids)} 个音频文件)...")
+    print(f"Precomputing DEAM features ({len(all_ids)} audio files)...")
     
     for audio_id in tqdm(all_ids, desc="DEAM"):
         output_path = os.path.join(output_dir, f"{audio_id}.pt")
         
-        # 跳过已存在的文件
+        # Skip files that already exist
         if os.path.exists(output_path):
             continue
         
         audio_path = os.path.join(audio_root, f"{audio_id}.mp3")
         if not os.path.exists(audio_path):
-            print(f"警告: 音频文件不存在 {audio_path}")
+            print(f"Warning: audio file not found: {audio_path}")
             continue
         
         try:
             features = extract_features_for_audio(audio_path, processor, model, device)
             torch.save(features, output_path)
         except Exception as e:
-            print(f"错误处理 {audio_id}: {e}")
+            print(f"Error processing {audio_id}: {e}")
     
-    print(f"DEAM 特征已保存到 {output_dir}")
+    print(f"DEAM features saved to {output_dir}")
 
 
 def precompute_mtg(output_dir, model_dir, device):
-    """预计算 MTG-Jamendo 数据集的特征（按 train/val/test 分别保存）"""
+    """Precompute features for MTG-Jamendo, saved separately by train/val/test split."""
     base_dir = os.path.dirname(os.path.abspath(__file__))
     label_path = os.path.join(base_dir, "data", "MTG-Jamendo", "mtg_labels.csv")
     audio_root = os.path.join(base_dir, "data", "MTG-Jamendo")
     
     processor, model = load_mert_model(model_dir, device)
     
-    # 创建 train/val/test 子目录
+    # Create train/val/test subdirectories
     for split in ['train', 'val', 'test']:
         os.makedirs(os.path.join(output_dir, split), exist_ok=True)
     
-    # 收集所有 track 信息（包含 split）
+    # Collect all track records, including split information
     tracks = []
     with open(label_path, "r", newline="") as f:
         reader = csv.DictReader(f)
@@ -166,7 +166,7 @@ def precompute_mtg(output_dir, model_dir, device):
             except ValueError:
                 continue
 
-            # mtg_labels.csv 写入的 audio_path 是 numeric 真实路径：{track_id%100}/{track_id}.low.mp3
+            # mtg_labels.csv stores the real numeric audio path: {track_id%100}/{track_id}.low.mp3
             audio_path_rel = (row.get("audio_path") or "").strip()
             if not audio_path_rel:
                 continue
@@ -174,13 +174,13 @@ def precompute_mtg(output_dir, model_dir, device):
             if os.path.exists(audio_path):
                 tracks.append((split, track_id, audio_path))
     
-    print(f"预计算 MTG-Jamendo 数据集 ({len(tracks)} 个音频文件)...")
+    print(f"Precomputing MTG-Jamendo features ({len(tracks)} audio files)...")
     
     for split, track_id, audio_path in tqdm(tracks, desc="MTG-Jamendo"):
-        # 保存到对应的 split 子目录
+        # Save to the matching split subdirectory
         output_path = os.path.join(output_dir, split, f"{track_id}.pt")
         
-        # 跳过已存在的文件
+        # Skip files that already exist
         if os.path.exists(output_path):
             continue
         
@@ -188,29 +188,29 @@ def precompute_mtg(output_dir, model_dir, device):
             features = extract_features_for_audio(audio_path, processor, model, device)
             torch.save(features, output_path)
         except Exception as e:
-            print(f"错误处理 {track_id}: {e}")
+            print(f"Error processing {track_id}: {e}")
     
-    print(f"MTG-Jamendo 特征已保存到 {output_dir} (按 train/val/test 分目录)")
+    print(f"MTG-Jamendo features saved to {output_dir} (organized by train/val/test)")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="预计算音频特征")
+    parser = argparse.ArgumentParser(description="Precompute audio features")
     parser.add_argument('--dataset', type=str, required=True, choices=['deam', 'mtg-jamendo', 'all'],
-                        help='要处理的数据集')
+                        help='Dataset to process')
     parser.add_argument('--output_dir', type=str, default=None,
-                        help='输出目录 (默认: data/features/<dataset>)')
+                        help='Output directory (default: data/features/<dataset>)')
     parser.add_argument('--model_dir', type=str, default='MERT',
-                        help='MERT 模型目录')
+                        help='MERT model directory')
     args = parser.parse_args()
     
-    # 设备配置
+    # Device configuration
     if torch.backends.mps.is_available():
         device = torch.device("mps")
     elif torch.cuda.is_available():
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
-    print(f"使用设备: {device}")
+    print(f"Using device: {device}")
     
     base_dir = os.path.dirname(os.path.abspath(__file__))
     

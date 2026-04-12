@@ -1,10 +1,10 @@
 #!/usr/bin/env python
-"""优化版数据加载器 - 支持预计算特征缓存，大幅加速训练。
+"""Optimized dataloader with precomputed feature caching for much faster training.
 
-主要优化:
-1. 支持从磁盘加载预计算的 MERT/mel/chroma/tempogram 特征
-2. 支持多进程数据加载 (num_workers > 0)
-3. 训练时的数据增强（SpecAugment）在加载缓存特征后应用
+Main improvements:
+1. Load precomputed MERT/mel/chroma/tempogram features from disk
+2. Support multiprocessing data loading (num_workers > 0)
+3. Apply training-time augmentation (SpecAugment) after loading cached features
 """
 
 import os
@@ -18,7 +18,7 @@ import numpy as np
 import librosa
 from torch.utils.data import Dataset, DataLoader
 
-# MERT model cache (仅在非缓存模式下使用)
+# MERT model cache (used only in non-cached mode)
 _MERT_MODEL_CACHE = {
     "dir": None,
     "processor": None,
@@ -73,7 +73,7 @@ def load_mert_model(model_dir):
 
 
 class DEAMDatasetCached(Dataset):
-    """DEAM Dataset - 从预计算缓存加载特征（快速版）"""
+    """DEAM dataset that loads features from the precomputed cache (fast version)."""
 
     def __init__(
         self,
@@ -99,14 +99,14 @@ class DEAMDatasetCached(Dataset):
             split_data = json.load(f)
             self.audio_ids = _apply_subset(split_data[self.split], subset_fraction, subset_seed)
 
-        # 验证缓存文件是否存在
+        # Validate that cached feature files exist
         valid_ids = []
         for audio_id in self.audio_ids:
             cache_path = os.path.join(self.cache_dir, f"{audio_id}.pt")
             if os.path.exists(cache_path):
                 valid_ids.append(audio_id)
             else:
-                print(f"警告: 缓存文件不存在 {cache_path}")
+                print(f"Warning: cache file not found: {cache_path}")
         self.audio_ids = valid_ids
 
         # Load labels
@@ -149,7 +149,7 @@ class DEAMDatasetCached(Dataset):
     def __getitem__(self, idx):
         audio_id = self.audio_ids[idx]
         
-        # 加载预计算的特征
+        # Load precomputed features
         cache_path = os.path.join(self.cache_dir, f"{audio_id}.pt")
         features = torch.load(cache_path, weights_only=True)
         
@@ -158,7 +158,7 @@ class DEAMDatasetCached(Dataset):
         chroma = features['chroma']
         tempogram = features['tempogram']
         
-        # 应用 SpecAugment (仅训练集)
+        # Apply SpecAugment (training split only)
         if self.apply_augment:
             # mel: [Time, n_mels] -> [n_mels, Time] for augment
             mel_t = mel.transpose(0, 1).float()
@@ -179,7 +179,7 @@ class DEAMDatasetCached(Dataset):
 
 
 class MTGJamendoDatasetCached(Dataset):
-    """MTG-Jamendo Dataset - 从预计算缓存加载特征（快速版）"""
+    """MTG-Jamendo dataset that loads features from the precomputed cache (fast version)."""
 
     def __init__(
         self,
@@ -241,7 +241,7 @@ class MTGJamendoDatasetCached(Dataset):
                 if split != self.split:
                     continue
 
-                # 使用 split/track_id 格式的缓存路径 (e.g., train/948.pt)
+                # Use split/track_id cache paths (e.g. train/948.pt)
                 cache_path = os.path.join(self.cache_dir, split, f"{track_id}.pt")
                 if not os.path.exists(cache_path):
                     continue
@@ -272,7 +272,7 @@ class MTGJamendoDatasetCached(Dataset):
     def __getitem__(self, idx):
         item = self.data[idx]
         
-        # 加载预计算的特征
+        # Load precomputed features
         features = torch.load(item["cache_path"], weights_only=True)
         
         mert = features['mert']
@@ -280,7 +280,7 @@ class MTGJamendoDatasetCached(Dataset):
         chroma = features['chroma']
         tempogram = features['tempogram']
         
-        # 应用 SpecAugment (仅训练集)
+        # Apply SpecAugment (training split only)
         if self.apply_augment:
             mel_t = mel.transpose(0, 1).float()
             mel_t = self.time_mask(mel_t)
@@ -344,7 +344,7 @@ def collate_fn(batch, enabled_features=None):
                 padded = torch.nn.functional.pad(feat, (0, 0, 0, pad_len))
             else:
                 padded = feat
-            # 统一转换为 float32，避免 float16/bfloat16 混合
+            # Normalize to float32 to avoid float16/bfloat16 mixing issues
             if padded.dtype != torch.float32:
                 padded = padded.float()
             padded_features.append(padded)
@@ -359,17 +359,17 @@ def collate_fn(batch, enabled_features=None):
 def get_dataloader_fast(dataset_name, split="train", batch_size=8, shuffle=True,
                         num_workers=4, prefetch_factor=2, pin_memory=True,
                         enabled_features=None, **kwargs):
-    """获取优化后的数据加载器（使用预计算特征）
+    """Get the optimized dataloader that uses precomputed features.
 
     Args:
-        dataset_name: 'deam' 或 'mtg-jamendo'
-        split: 'train', 'val', 或 'test'
-        batch_size: 批大小
-        shuffle: 是否打乱
-        num_workers: 数据加载进程数（推荐 2-4）
-        prefetch_factor: 每个 worker 预取的批次数
-        pin_memory: 是否将数据固定在内存（加速 GPU 传输）
-        **kwargs: 其他参数传递给 Dataset
+        dataset_name: 'deam' or 'mtg-jamendo'
+        split: 'train', 'val', or 'test'
+        batch_size: Batch size
+        shuffle: Whether to shuffle
+        num_workers: Number of data loading workers (recommended 2-4)
+        prefetch_factor: Number of prefetched batches per worker
+        pin_memory: Whether to pin memory for faster GPU transfers
+        **kwargs: Additional arguments passed to the Dataset
     """
     if dataset_name == "deam":
         dataset = DEAMDatasetCached(split=split, **kwargs)
@@ -378,8 +378,8 @@ def get_dataloader_fast(dataset_name, split="train", batch_size=8, shuffle=True,
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
-    # 对于 macOS，num_workers > 0 时使用 spawn 模式可能有问题
-    # 但加载预计算特征通常很快，所以 num_workers=0 也可接受
+    # On macOS, spawn mode with num_workers > 0 can be problematic.
+    # Cached feature loading is usually fast enough that num_workers=0 is acceptable.
     loader_kwargs = {
         'batch_size': batch_size,
         'shuffle': shuffle,
@@ -396,11 +396,11 @@ def get_dataloader_fast(dataset_name, split="train", batch_size=8, shuffle=True,
 
 
 # ============================================================================
-# 兼容旧接口 - 实时特征提取版本（保留原始功能）
+# Backward-compatible legacy interface for on-the-fly feature extraction
 # ============================================================================
 
 class DEAMDataset(Dataset):
-    """DEAM Dataset with on-the-fly feature extraction (原始版本)"""
+    """DEAM dataset with on-the-fly feature extraction (legacy version)."""
 
     def __init__(
         self,
@@ -519,7 +519,7 @@ class DEAMDataset(Dataset):
 
 
 class MTGJamendoDataset(Dataset):
-    """MTG-Jamendo Dataset with on-the-fly feature extraction (原始版本)"""
+    """MTG-Jamendo dataset with on-the-fly feature extraction (legacy version)."""
 
     def __init__(
         self,
@@ -690,7 +690,7 @@ class MTGJamendoDataset(Dataset):
 
 
 def get_dataloader(dataset_name, split="train", batch_size=8, shuffle=True, num_workers=0, **kwargs):
-    """Get dataloader for the specified dataset (原始版本，实时提取特征)"""
+    """Get a dataloader for the specified dataset (legacy on-the-fly extraction version)."""
     if dataset_name == "deam":
         dataset = DEAMDataset(split=split, **kwargs)
     elif dataset_name == "mtg-jamendo":
@@ -713,21 +713,21 @@ if __name__ == "__main__":
     import sys
     
     print("=" * 60)
-    print("测试优化版数据加载器 (使用预计算特征)")
+    print("Testing the optimized dataloader (using precomputed features)")
     print("=" * 60)
     
-    # 检查缓存目录是否存在
+    # Check whether cache directories exist
     base_dir = os.path.dirname(os.path.abspath(__file__))
     deam_cache = os.path.join(base_dir, "data", "features", "deam")
     mtg_cache = os.path.join(base_dir, "data", "features", "mtg")
     
     if not os.path.exists(deam_cache) or not os.path.exists(mtg_cache):
-        print("\n⚠️  缓存目录不存在！请先运行预计算脚本：")
+        print("\n⚠️  Cache directories do not exist. Please run the precompute script first:")
         print("   python precompute_features.py --dataset all")
-        print("\n将使用原始数据加载器进行测试...")
+        print("\nFalling back to the legacy dataloader for testing...")
         
-        # 测试原始 DEAM dataloader
-        print("\n测试 DEAM Dataloader (原始版本)...")
+        # Test the legacy DEAM dataloader
+        print("\nTesting DEAM dataloader (legacy version)...")
         deam_loader = get_dataloader("deam", split="train", batch_size=2, model_dir="MERT")
         deam_batch = next(iter(deam_loader))
         deam_features, deam_labels = deam_batch
@@ -736,8 +736,8 @@ if __name__ == "__main__":
             print(f"  {key}: {val.shape}")
         print(f"DEAM Batch Labels: {deam_labels.shape}")
     else:
-        # 测试优化版 DEAM dataloader
-        print("\n测试 DEAM Dataloader (优化版)...")
+        # Test the optimized DEAM dataloader
+        print("\nTesting DEAM dataloader (optimized version)...")
         deam_loader = get_dataloader_fast("deam", split="train", batch_size=4, num_workers=0)
         deam_batch = next(iter(deam_loader))
         deam_features, deam_labels = deam_batch
@@ -746,8 +746,8 @@ if __name__ == "__main__":
             print(f"  {key}: {val.shape}, dtype={val.dtype}")
         print(f"DEAM Batch Labels: {deam_labels.shape}")
         
-        # 测试优化版 MTG-Jamendo dataloader
-        print("\n测试 MTG-Jamendo Dataloader (优化版)...")
+        # Test the optimized MTG-Jamendo dataloader
+        print("\nTesting MTG-Jamendo dataloader (optimized version)...")
         mtg_loader = get_dataloader_fast("mtg-jamendo", split="train", batch_size=4, num_workers=0)
         mtg_batch = next(iter(mtg_loader))
         mtg_features, mtg_labels = mtg_batch
@@ -756,4 +756,4 @@ if __name__ == "__main__":
             print(f"  {key}: {val.shape}, dtype={val.dtype}")
         print(f"MTG-Jamendo Batch Labels: {mtg_labels.shape}")
         
-        print("\n✅ 优化版数据加载器测试通过!")
+        print("\n✅ Optimized dataloader test passed!")
