@@ -269,10 +269,54 @@ def _rmse_np(pred: np.ndarray, target: np.ndarray) -> float:
     return float(np.nanmean(rmse_per_dim))
 
 
+def _r2_np_per_dim(pred: np.ndarray, target: np.ndarray) -> np.ndarray:
+    # pred/target: [N, D]
+    target_mean = target.mean(axis=0, dtype=np.float64)
+    residual_sum = ((target - pred) ** 2).sum(axis=0, dtype=np.float64)
+    total_sum = ((target - target_mean) ** 2).sum(axis=0, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r2 = 1.0 - (residual_sum / total_sum)
+    r2 = np.where(total_sum > 0.0, r2, np.nan)
+    return r2.astype(np.float64, copy=False)
+
+
+def _r2_np(pred: np.ndarray, target: np.ndarray) -> float:
+    return float(np.nanmean(_r2_np_per_dim(pred, target)))
+
+
 def _ensure_metrics_header(path: str, header: list[str]) -> None:
     if not os.path.exists(path):
         with open(path, "w") as f:
             f.write(",".join(header) + "\n")
+        return
+
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    if not lines:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(",".join(header) + "\n")
+        return
+
+    existing_header = lines[0].rstrip("\n").split(",")
+    if existing_header == header:
+        return
+
+    existing_index = {name: idx for idx, name in enumerate(existing_header)}
+    rewritten_lines = [",".join(header) + "\n"]
+    for line in lines[1:]:
+        stripped = line.rstrip("\n")
+        if not stripped:
+            continue
+        values = stripped.split(",")
+        row = []
+        for column in header:
+            idx = existing_index.get(column)
+            row.append(values[idx] if idx is not None and idx < len(values) else "nan")
+        rewritten_lines.append(",".join(row) + "\n")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(rewritten_lines)
 
 
 def _format_metric_value(value: object) -> str:
@@ -483,6 +527,9 @@ def main():
         "val_deam_ccc_epoch",
         "val_deam_ccc_valence",
         "val_deam_ccc_arousal",
+        "val_deam_r2_valence",
+        "val_deam_r2_arousal",
+        "val_deam_r2_mean",
         "mtg_threshold",
         "mtg_roc_auc_micro",
         "mtg_roc_auc_macro",
@@ -498,6 +545,33 @@ def main():
     metrics_path = os.path.join(log_dir, "metrics.csv")
     _ensure_metrics_header(metrics_path, metrics_header)
     logger.info(f"Epoch metrics will be saved to: {metrics_path}")
+
+    test_metrics_header = [
+        "test_loss",
+        "test_deam_ccc",
+        "test_deam_rmse",
+        "test_deam_pearson",
+        "test_deam_ccc_epoch",
+        "test_deam_ccc_valence",
+        "test_deam_ccc_arousal",
+        "test_deam_r2_valence",
+        "test_deam_r2_arousal",
+        "test_deam_r2_mean",
+        "test_mtg_threshold",
+        "test_mtg_roc_auc_micro",
+        "test_mtg_roc_auc_macro",
+        "test_mtg_pr_auc_micro",
+        "test_mtg_pr_auc_macro",
+        "test_mtg_f1_micro",
+        "test_mtg_f1_macro",
+        "test_mtg_precision_micro",
+        "test_mtg_precision_macro",
+        "test_mtg_recall_micro",
+        "test_mtg_recall_macro",
+    ]
+    test_metrics_path = os.path.join(log_dir, "test_metrics.csv")
+    _ensure_metrics_header(test_metrics_path, test_metrics_header)
+    logger.info(f"Final test metrics will be saved to: {test_metrics_path}")
 
     # 2. Configure device (prefer MPS on macOS)
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -927,22 +1001,33 @@ def main():
         deam_ccc_epoch = float("nan")
         deam_ccc_valence = float("nan")
         deam_ccc_arousal = float("nan")
+        deam_r2_valence = float("nan")
+        deam_r2_arousal = float("nan")
+        deam_r2_mean = float("nan")
         if deam_val_preds and deam_val_targets:
             deam_pred = np.concatenate(deam_val_preds, axis=0)
             deam_tgt = np.concatenate(deam_val_targets, axis=0)
 
             deam_ccc_per_dim = _ccc_np_per_dim(deam_pred, deam_tgt)
+            deam_r2_per_dim = _r2_np_per_dim(deam_pred, deam_tgt)
             deam_rmse = _rmse_np(deam_pred, deam_tgt)
             deam_pearson = _pearson_np(deam_pred, deam_tgt)
             deam_ccc_epoch = _ccc_np(deam_pred, deam_tgt)
+            deam_r2_mean = _r2_np(deam_pred, deam_tgt)
             writer.add_scalar('Validation/DEAM_RMSE', deam_rmse, optimizer_step)
             writer.add_scalar('Validation/DEAM_Pearson', deam_pearson, optimizer_step)
             writer.add_scalar('Validation/DEAM_CCC_epoch', deam_ccc_epoch, optimizer_step)
+            writer.add_scalar('Validation/DEAM_R2_Mean', deam_r2_mean, optimizer_step)
             if deam_ccc_per_dim.size >= 2:
                 deam_ccc_valence = float(deam_ccc_per_dim[0])
                 deam_ccc_arousal = float(deam_ccc_per_dim[1])
                 writer.add_scalar('Validation/DEAM_CCC_Valence', deam_ccc_valence, optimizer_step)
                 writer.add_scalar('Validation/DEAM_CCC_Arousal', deam_ccc_arousal, optimizer_step)
+            if deam_r2_per_dim.size >= 2:
+                deam_r2_valence = float(deam_r2_per_dim[0])
+                deam_r2_arousal = float(deam_r2_per_dim[1])
+                writer.add_scalar('Validation/DEAM_R2_Valence', deam_r2_valence, optimizer_step)
+                writer.add_scalar('Validation/DEAM_R2_Arousal', deam_r2_arousal, optimizer_step)
 
         # Compute epoch-level MTG metrics on full validation set
         mtg_threshold = float("nan")
@@ -1020,7 +1105,8 @@ def main():
             f"Epoch {epoch+1}/{args.epochs} "
             f"train: loss={epoch_loss:.4f} deam_ccc={avg_deam_ccc:.4f} "
             f"| val: loss={val_epoch_loss:.4f} deam_ccc={val_avg_deam_ccc:.4f} "
-            f"rmse={deam_rmse:.4f} r={deam_pearson:.4f} ccc={deam_ccc_epoch:.4f}"
+            f"rmse={deam_rmse:.4f} r={deam_pearson:.4f} ccc={deam_ccc_epoch:.4f} "
+            f"r2(v/a/m)={deam_r2_valence:.4f}/{deam_r2_arousal:.4f}/{deam_r2_mean:.4f}"
             f"{mtg_line}{best_line}"
         )
         logger.info(f"time: epoch={epoch_dt:.1f}s (val={val_dt:.1f}s) lr={lr:.1e}")
@@ -1033,6 +1119,9 @@ def main():
                 ("Val DEAM CCC", f"{val_avg_deam_ccc:.4f}"),
                 ("Val RMSE", f"{deam_rmse:.4f}"),
                 ("Val Pearson", f"{deam_pearson:.4f}"),
+                ("Val R2 Valence", f"{deam_r2_valence:.4f}"),
+                ("Val R2 Arousal", f"{deam_r2_arousal:.4f}"),
+                ("Val R2 Mean", f"{deam_r2_mean:.4f}"),
                 ("MTG F1 Micro", f"{mtg_m['f1_micro']:.4f}"),
                 ("MTG PR-AUC Micro", f"{mtg_m['pr_auc_micro']:.4f}"),
                 ("Threshold", f"{mtg_threshold:.2f}"),
@@ -1056,6 +1145,9 @@ def main():
                 "val_deam_ccc_epoch": deam_ccc_epoch,
                 "val_deam_ccc_valence": deam_ccc_valence,
                 "val_deam_ccc_arousal": deam_ccc_arousal,
+                "val_deam_r2_valence": deam_r2_valence,
+                "val_deam_r2_arousal": deam_r2_arousal,
+                "val_deam_r2_mean": deam_r2_mean,
                 "mtg_threshold": mtg_threshold,
                 "mtg_roc_auc_micro": mtg_m["roc_auc_micro"],
                 "mtg_roc_auc_macro": mtg_m["roc_auc_macro"],
@@ -1224,17 +1316,38 @@ def main():
     writer.add_scalar('Test/Loss', test_epoch_loss, optimizer_step)
     writer.add_scalar('Test/DEAM_CCC', test_avg_deam_ccc, optimizer_step)
 
+    test_deam_rmse = float("nan")
+    test_deam_pearson = float("nan")
+    test_deam_ccc_epoch = float("nan")
+    test_deam_ccc_valence = float("nan")
+    test_deam_ccc_arousal = float("nan")
+    test_deam_r2_valence = float("nan")
+    test_deam_r2_arousal = float("nan")
+    test_deam_r2_mean = float("nan")
     if deam_test_preds and deam_test_targets:
         deam_pred = np.concatenate(deam_test_preds, axis=0)
         deam_tgt = np.concatenate(deam_test_targets, axis=0)
 
         deam_ccc_per_dim = _ccc_np_per_dim(deam_pred, deam_tgt)
-        writer.add_scalar('Test/DEAM_RMSE', _rmse_np(deam_pred, deam_tgt), optimizer_step)
-        writer.add_scalar('Test/DEAM_Pearson', _pearson_np(deam_pred, deam_tgt), optimizer_step)
-        writer.add_scalar('Test/DEAM_CCC_epoch', _ccc_np(deam_pred, deam_tgt), optimizer_step)
+        deam_r2_per_dim = _r2_np_per_dim(deam_pred, deam_tgt)
+        test_deam_rmse = _rmse_np(deam_pred, deam_tgt)
+        test_deam_pearson = _pearson_np(deam_pred, deam_tgt)
+        test_deam_ccc_epoch = _ccc_np(deam_pred, deam_tgt)
+        test_deam_r2_mean = _r2_np(deam_pred, deam_tgt)
+        writer.add_scalar('Test/DEAM_RMSE', test_deam_rmse, optimizer_step)
+        writer.add_scalar('Test/DEAM_Pearson', test_deam_pearson, optimizer_step)
+        writer.add_scalar('Test/DEAM_CCC_epoch', test_deam_ccc_epoch, optimizer_step)
+        writer.add_scalar('Test/DEAM_R2_Mean', test_deam_r2_mean, optimizer_step)
         if deam_ccc_per_dim.size >= 2:
-            writer.add_scalar('Test/DEAM_CCC_Valence', float(deam_ccc_per_dim[0]), optimizer_step)
-            writer.add_scalar('Test/DEAM_CCC_Arousal', float(deam_ccc_per_dim[1]), optimizer_step)
+            test_deam_ccc_valence = float(deam_ccc_per_dim[0])
+            test_deam_ccc_arousal = float(deam_ccc_per_dim[1])
+            writer.add_scalar('Test/DEAM_CCC_Valence', test_deam_ccc_valence, optimizer_step)
+            writer.add_scalar('Test/DEAM_CCC_Arousal', test_deam_ccc_arousal, optimizer_step)
+        if deam_r2_per_dim.size >= 2:
+            test_deam_r2_valence = float(deam_r2_per_dim[0])
+            test_deam_r2_arousal = float(deam_r2_per_dim[1])
+            writer.add_scalar('Test/DEAM_R2_Valence', test_deam_r2_valence, optimizer_step)
+            writer.add_scalar('Test/DEAM_R2_Arousal', test_deam_r2_arousal, optimizer_step)
 
     if mtg_test_scores and mtg_test_targets:
         y_score = np.concatenate(mtg_test_scores, axis=0)
@@ -1252,17 +1365,63 @@ def main():
         writer.add_scalar('Test/MTG_Precision_macro', mtg_m['precision_macro'], optimizer_step)
         writer.add_scalar('Test/MTG_Recall_micro', mtg_m['recall_micro'], optimizer_step)
         writer.add_scalar('Test/MTG_Recall_macro', mtg_m['recall_macro'], optimizer_step)
+    else:
+        test_threshold = float("nan")
+        mtg_m = {
+            "roc_auc_micro": float("nan"),
+            "roc_auc_macro": float("nan"),
+            "pr_auc_micro": float("nan"),
+            "pr_auc_macro": float("nan"),
+            "f1_micro": float("nan"),
+            "f1_macro": float("nan"),
+            "precision_micro": float("nan"),
+            "precision_macro": float("nan"),
+            "recall_micro": float("nan"),
+            "recall_macro": float("nan"),
+        }
+
+    _append_epoch_metrics(
+        test_metrics_path,
+        test_metrics_header,
+        {
+            "test_loss": test_epoch_loss,
+            "test_deam_ccc": test_avg_deam_ccc,
+            "test_deam_rmse": test_deam_rmse,
+            "test_deam_pearson": test_deam_pearson,
+            "test_deam_ccc_epoch": test_deam_ccc_epoch,
+            "test_deam_ccc_valence": test_deam_ccc_valence,
+            "test_deam_ccc_arousal": test_deam_ccc_arousal,
+            "test_deam_r2_valence": test_deam_r2_valence,
+            "test_deam_r2_arousal": test_deam_r2_arousal,
+            "test_deam_r2_mean": test_deam_r2_mean,
+            "test_mtg_threshold": test_threshold,
+            "test_mtg_roc_auc_micro": mtg_m["roc_auc_micro"],
+            "test_mtg_roc_auc_macro": mtg_m["roc_auc_macro"],
+            "test_mtg_pr_auc_micro": mtg_m["pr_auc_micro"],
+            "test_mtg_pr_auc_macro": mtg_m["pr_auc_macro"],
+            "test_mtg_f1_micro": mtg_m["f1_micro"],
+            "test_mtg_f1_macro": mtg_m["f1_macro"],
+            "test_mtg_precision_micro": mtg_m["precision_micro"],
+            "test_mtg_precision_macro": mtg_m["precision_macro"],
+            "test_mtg_recall_micro": mtg_m["recall_micro"],
+            "test_mtg_recall_macro": mtg_m["recall_macro"],
+        },
+    )
 
     # Print test summary
     logger.info(f"Test Loss: {test_epoch_loss:.4f}")
     logger.info(f"Test DEAM CCC: {test_avg_deam_ccc:.4f}")
     if deam_test_preds and deam_test_targets:
-        logger.info(f"Test DEAM RMSE: {_rmse_np(deam_pred, deam_tgt):.4f}")
-        logger.info(f"Test DEAM Pearson: {_pearson_np(deam_pred, deam_tgt):.4f}")
-        logger.info(f"Test DEAM CCC (epoch): {_ccc_np(deam_pred, deam_tgt):.4f}")
+        logger.info(f"Test DEAM RMSE: {test_deam_rmse:.4f}")
+        logger.info(f"Test DEAM Pearson: {test_deam_pearson:.4f}")
+        logger.info(f"Test DEAM CCC (epoch): {test_deam_ccc_epoch:.4f}")
+        logger.info(
+            f"Test DEAM R2 (V/A/Mean): "
+            f"{test_deam_r2_valence:.4f}/{test_deam_r2_arousal:.4f}/{test_deam_r2_mean:.4f}"
+        )
         if deam_ccc_per_dim.size >= 2:
-            logger.info(f"Test DEAM CCC Valence: {float(deam_ccc_per_dim[0]):.4f}")
-            logger.info(f"Test DEAM CCC Arousal: {float(deam_ccc_per_dim[1]):.4f}")
+            logger.info(f"Test DEAM CCC Valence: {test_deam_ccc_valence:.4f}")
+            logger.info(f"Test DEAM CCC Arousal: {test_deam_ccc_arousal:.4f}")
     if mtg_test_scores and mtg_test_targets:
         logger.info(
             "Test MTG "
@@ -1279,8 +1438,11 @@ def main():
         metrics=[
             ("Test Loss", f"{test_epoch_loss:.4f}"),
             ("Test DEAM CCC", f"{test_avg_deam_ccc:.4f}"),
-            ("Test DEAM RMSE", f"{_rmse_np(deam_pred, deam_tgt):.4f}" if deam_test_preds and deam_test_targets else "nan"),
-            ("Test Pearson", f"{_pearson_np(deam_pred, deam_tgt):.4f}" if deam_test_preds and deam_test_targets else "nan"),
+            ("Test DEAM RMSE", f"{test_deam_rmse:.4f}"),
+            ("Test Pearson", f"{test_deam_pearson:.4f}"),
+            ("Test R2 Valence", f"{test_deam_r2_valence:.4f}"),
+            ("Test R2 Arousal", f"{test_deam_r2_arousal:.4f}"),
+            ("Test R2 Mean", f"{test_deam_r2_mean:.4f}"),
             ("Test MTG F1 Micro", f"{mtg_m['f1_micro']:.4f}" if mtg_test_scores and mtg_test_targets else "nan"),
             ("Test MTG PR-AUC Micro", f"{mtg_m['pr_auc_micro']:.4f}" if mtg_test_scores and mtg_test_targets else "nan"),
             ("Test Threshold", f"{test_threshold:.2f}" if mtg_test_scores and mtg_test_targets else "nan"),
