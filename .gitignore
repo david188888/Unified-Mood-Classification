@@ -1,31 +1,17 @@
-data/
-MERT/
-CLAUDE.md 
-.vscode/
-.CLAUDE
-__pycache__
 .DS_Store
-tes
-test/test_data.py
-.github/
-runs/
-test/
-.gitignore
-.gitignore
-src/models/output_heads.py
-src/__init__.py
-note/
-unified_mood_model_early.pt
-src/models/__init__.py
-src/losses/__init__.py
-thesis_figures
-AGENTS.md
-thesis_results_chapter.md
-methodology_detailed.md
+__pycache__/
+*.py[cod]
+.venv/
+.vscode/
+.playwright-cli/
 
-future_work_conclusion.md
-unified_mood_model_late.pt
-note.md
-user_manual_appendix.md
-maintenance_manual_appendix.md
-.playwright-cli
+# Local datasets, pretrained models, cached features, checkpoints, and outputs.
+MERT/
+runs/
+*.pt
+unified_mood_model_*.pt
+thesis_figures/
+source_code_listing.md
+
+# Local dataset assets and local-only data preparation helpers.
+data/
